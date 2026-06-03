@@ -78,6 +78,36 @@ LaunchedEffect(userId) {
 }
 ```
 
+### `rememberUpdatedState` values are stale inside `remember {}` blocks
+
+`rememberUpdatedState` returns a `State` object whose `.value` is updated on every recomposition. The "latest" behavior only helps when the State is **read lazily** — inside an effect body or a lambda that runs later — not when the value is captured eagerly.
+
+Inside a `remember {}` block the producer lambda runs once. Reading the delegate there snapshots the current `.value` into the remembered object — future State updates never reach it:
+
+```kotlin
+val latestChannelId by rememberUpdatedState(channelId)
+
+// ❌ BAD — channelId is read once when remember's lambda executes;
+// the destination holds the initial value forever
+val destination = remember {
+    Destination(channelId = latestChannelId)
+}
+
+// ✅ GOOD — skip rememberUpdatedState; key remember on the changing value
+val destination = remember(channelId) {
+    Destination(channelId = channelId)
+}
+
+// ✅ ALSO GOOD — wrapping lambda defers the read to each invocation
+val destination = remember {
+    Destination(channelId = { latestChannelId })
+}
+```
+
+The same trap applies anywhere a `rememberUpdatedState` delegate is **read eagerly** rather than deferred behind a lambda or effect body: data classes constructed in `remember`, objects built once in `DisposableEffect`'s setup block, or any expression evaluated at creation time.
+
+When the captured value should trigger recreation of the remembered object, make it a `remember` key and skip `rememberUpdatedState` entirely. Reserve `rememberUpdatedState` for values that must stay fresh inside a long-lived scope (effect coroutine, event callback) **without** restarting that scope.
+
 `rememberUpdatedState` also does not make render state "non-recomposing." If the UI needs to display a changing value, read normal `State` in composition or use the deferred-read patterns in [`compose-state-deferred-reads`](../compose-state-deferred-reads/SKILL.md) for frame-rate values.
 
 ## Collecting Flow
@@ -151,20 +181,21 @@ Every registration path should have a matching `onDispose` cleanup path.
 
 ## Common mistakes
 
-| Mistake | Fix |
-|---|---|
-| Network request directly in the composable body | Usually move to a ViewModel/state holder; use `LaunchedEffect` only for UI-owned keyed work |
-| Analytics property written from the composable body | Use `SideEffect` when it should publish after every successful recomposition |
-| Impression/event logged from the composable body | Use `LaunchedEffect(key)` when it should run once for that key |
-| `LaunchedEffect(Unit)` captures changing `id` | Key by `id`, or use `rememberUpdatedState` if it must not restart |
+| Mistake | Diagnosis | Fix |
+|---|---|---|
+| Network request directly in the composable body | Side work in composition | Usually move to a ViewModel/state holder; use `LaunchedEffect` only for UI-owned keyed work |
+| Analytics property written from the composable body | Side work in composition | Use `SideEffect` when it should publish after every successful recomposition |
+| Impression/event logged from the composable body | Side work in composition | Use `LaunchedEffect(key)` when it should run once for that key |
+| `LaunchedEffect(Unit)` captures changing `id` | Missing key | Key by `id`, or use `rememberUpdatedState` if it must not restart |
 | `rememberUpdatedState(id)` used so `LaunchedEffect(Unit)` keeps running after `id` changes | Hidden lifecycle bug | Key the effect by `id` |
 | Long-lived effect invokes an old callback after recomposition | Stale capture | Wrap the callback with `rememberUpdatedState` and call the wrapper inside the effect |
-| `LaunchedEffect(state) { ... }` restarts too often | Key by the specific property |
-| `LaunchedEffect(...) { nonSuspendSetter() }` | Usually `SideEffect`; keep `LaunchedEffect` only for keyed one-shot/deferred work |
-| Listener added in `LaunchedEffect` with no cleanup | Use `DisposableEffect` |
-| Launching from click by setting `shouldShowSnackbar = true` | Use `rememberCoroutineScope()` in the click callback |
+| `rememberUpdatedState` delegate read directly in `remember {}` (e.g. `Destination(id = latestId)`) | Value captured once, never refreshed | Make the value a `remember` key: `remember(id) { Destination(id = id) }` |
+| `LaunchedEffect(state) { ... }` restarts too often | Overly broad key | Key by the specific property |
+| `LaunchedEffect(...) { nonSuspendSetter() }` | Wrong effect type | Usually `SideEffect`; keep `LaunchedEffect` only for keyed one-shot/deferred work |
+| Listener added in `LaunchedEffect` with no cleanup | Missing disposal | Use `DisposableEffect` |
+| Launching from click by setting `shouldShowSnackbar = true` | Event flag anti-pattern | Use `rememberCoroutineScope()` in the click callback |
 | `if (isFocused) { … }` or focus read in composable body for side work | Side work during composition | `LaunchedEffect(focused) { … }` or `snapshotFlow` |
-| `onSizeChanged { heightState = it.height }` on measured composable | OK in isolation — but layout → composition back-write if a sibling reads `heightState` in composition | Siblings must consume height in measure phase, not `Modifier.height(state.dp)` in composition |
+| `onSizeChanged { heightState = it.height }` on measured composable | Layout → composition back-write if a sibling reads `heightState` in composition | Siblings must consume height in measure phase, not `Modifier.height(state.dp)` in composition |
 
 ## Focus and measurement
 
@@ -202,3 +233,4 @@ Use `snapshotFlow { … }` inside `LaunchedEffect` when you need to sample multi
 - A flow chain inside an effect with no terminal collection.
 - Effects whose keys are chosen to silence lint instead of model lifecycle.
 - Callback lambdas used from long-lived effects without either a key or `rememberUpdatedState`.
+- `rememberUpdatedState` delegate read eagerly inside a `remember {}` block or object constructor — the value is captured once and never refreshes.
