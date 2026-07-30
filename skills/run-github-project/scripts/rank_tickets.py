@@ -16,6 +16,11 @@ class InputError(ValueError):
 
 
 IMPLEMENTATION_ACTIONS = {"resume-pr", "resume-implementation"}
+CLAIM_ACTION_RANK = {
+    "resume-backlog-cleanup": 0,
+    "resume-pr": 1,
+    "resume-implementation": 1,
+}
 CANDIDATE_ACTION_ORDER = ("resume-pr", "resume-implementation", "plan")
 CANDIDATE_OUTPUT_ACTIONS = {"resume-implementation": "claim"}
 
@@ -50,6 +55,11 @@ def parse_args() -> argparse.Namespace:
         "--planning-status",
         default="Planning",
         help="Configured GitHub Project status display name that queues planning.",
+    )
+    parser.add_argument(
+        "--backlog-status",
+        default="Backlog",
+        help="Configured Project status display name that requires human work.",
     )
     parser.add_argument(
         "--ready-status",
@@ -199,11 +209,14 @@ def require_ticket_shape(ticket: Any) -> dict[str, Any]:
         "openPullRequests",
         "planningTransition",
         "readyTransition",
-        "implementationPlan",
     }
     missing = sorted(required - ticket.keys())
     if missing:
         raise InputError(f"ticket {ticket.get('number', '?')}: missing {', '.join(missing)}")
+    if "implementationPlan" not in ticket and "implementationPlans" not in ticket:
+        raise InputError(
+            f"ticket {ticket.get('number', '?')}: missing implementationPlans",
+        )
     number = ticket["number"]
     if not isinstance(number, int) or isinstance(number, bool):
         raise InputError(f"ticket {number!r}: number must be an integer")
@@ -252,10 +265,194 @@ def parse_transition(value: Any, field: str, number: Any) -> dict[str, Any]:
     return result
 
 
+def parse_replan_request(value: Any, number: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise InputError(f"ticket {number}: replanRequest must be an object")
+    result = {
+        field: nonempty_string(
+            value.get(field),
+            f"replanRequest.{field}",
+            number,
+        )
+        for field in (
+            "commentId",
+            "permalink",
+            "author",
+            "disposition",
+            "previousPlanPermalink",
+            "previousPlanDigest",
+            "baseSha",
+        )
+    }
+    result["createdAt"] = timestamp(
+        value.get("createdAt"),
+        "replanRequest.createdAt",
+        number,
+    )
+    for field in ("implementationHeadSha", "pullRequestUrl"):
+        optional = value.get(field)
+        if optional is not None and (not isinstance(optional, str) or not optional):
+            raise InputError(
+                f"ticket {number}: replanRequest.{field} "
+                "must be a non-empty string or null",
+            )
+        result[field] = optional
+    if result["disposition"] not in ("autonomous-replan", "human-required"):
+        raise InputError(
+            f"ticket {number}: replanRequest.disposition must be "
+            "'autonomous-replan' or 'human-required'",
+        )
+    return result
+
+
+def parse_implementation_plan_chain(
+    ticket: dict[str, Any],
+    number: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    values = ticket.get("implementationPlans")
+    if values is None:
+        legacy = ticket.get("implementationPlan")
+        if legacy is None:
+            return [], None
+        if not isinstance(legacy, dict):
+            raise InputError(
+                f"ticket {number}: implementationPlan must be an object or null",
+            )
+        values = [
+            {
+                **legacy,
+                "markerVersion": 1,
+                "revision": 1,
+                "supersedes": None,
+                "replanRequest": None,
+                "publishedAt": legacy.get("updatedAt"),
+                "isMinimized": False,
+            },
+        ]
+    if not isinstance(values, list):
+        raise InputError(f"ticket {number}: implementationPlans must be an array")
+
+    plans: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise InputError(
+                f"ticket {number}: implementationPlans entries must be objects",
+            )
+        plan = dict(value)
+        for field in (
+            "commentId",
+            "permalink",
+            "author",
+            "digest",
+            "plannedBranch",
+            "plannedSha",
+        ):
+            nonempty_string(plan.get(field), f"implementationPlan.{field}", number)
+        created_at = timestamp(
+            plan.get("createdAt"),
+            "implementationPlan.createdAt",
+            number,
+        )
+        published_at = timestamp(
+            plan.get("publishedAt"),
+            "implementationPlan.publishedAt",
+            number,
+        )
+        updated_at = timestamp(
+            plan.get("updatedAt"),
+            "implementationPlan.updatedAt",
+            number,
+        )
+        if published_at < created_at or updated_at < published_at:
+            raise InputError(
+                f"ticket {number}: implementation plan timestamps are out of order",
+            )
+        marker_version = plan.get("markerVersion")
+        revision = plan.get("revision")
+        if marker_version not in (1, 2):
+            raise InputError(
+                f"ticket {number}: implementationPlan.markerVersion must be 1 or 2",
+            )
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision <= 0
+        ):
+            raise InputError(
+                f"ticket {number}: implementationPlan.revision "
+                "must be a positive integer",
+            )
+        for field in ("supersedes", "replanRequest"):
+            optional = plan.get(field)
+            if optional is not None and (
+                not isinstance(optional, str) or not optional
+            ):
+                raise InputError(
+                    f"ticket {number}: implementationPlan.{field} "
+                    "must be a non-empty string or null",
+                )
+        if not isinstance(plan.get("isMinimized"), bool):
+            raise InputError(
+                f"ticket {number}: implementationPlan.isMinimized "
+                "must be a boolean",
+            )
+        if marker_version == 1 and (
+            revision != 1
+            or plan.get("supersedes") is not None
+            or plan.get("replanRequest") is not None
+        ):
+            raise InputError(
+                f"ticket {number}: a v1 implementation plan must be a revision-one root",
+            )
+        plans.append(plan)
+
+    if not plans:
+        return [], None
+
+    permalinks = [plan["permalink"] for plan in plans]
+    comment_ids = [plan["commentId"] for plan in plans]
+    revisions = [plan["revision"] for plan in plans]
+    if len(set(permalinks)) != len(permalinks):
+        raise InputError(f"ticket {number}: duplicate implementation plan permalink")
+    if len(set(comment_ids)) != len(comment_ids):
+        raise InputError(f"ticket {number}: duplicate implementation plan comment ID")
+    if len(set(revisions)) != len(revisions):
+        raise InputError(f"ticket {number}: duplicate implementation plan revision")
+
+    chain = sorted(plans, key=lambda plan: plan["revision"])
+    if (
+        chain[0]["supersedes"] is not None
+        or any(plan["supersedes"] is None for plan in chain[1:])
+    ):
+        raise InputError(
+            f"ticket {number}: implementation plan chain must have exactly one root",
+        )
+    if [plan["revision"] for plan in chain] != list(range(1, len(chain) + 1)):
+        raise InputError(
+            f"ticket {number}: implementation plan revisions must be contiguous",
+        )
+    for parent, child in zip(chain, chain[1:]):
+        if child["supersedes"] == parent["permalink"]:
+            continue
+        if child["supersedes"] not in permalinks:
+            raise InputError(
+                f"ticket {number}: implementation plan revision "
+                f"{child['revision']} has a missing predecessor",
+            )
+        raise InputError(f"ticket {number}: implementation plan chain forks")
+    active = chain[-1]
+    if active["isMinimized"]:
+        raise InputError(
+            f"ticket {number}: active implementation plan is minimized",
+        )
+    return plans, active
+
+
 def analyze_ticket(
     ticket: dict[str, Any],
     *,
     current_user: str,
+    backlog_status: str,
     planning_status: str,
     ready_status: str,
     in_progress_status: str,
@@ -276,10 +473,14 @@ def analyze_ticket(
     pull_requests = pull_request_values(ticket["openPullRequests"], number)
     project_position = parse_project_position(ticket["projectPosition"], number)
     project_status = ticket["projectStatus"]
+    assigned_to_current_user = current_user in assignees
+    recovering_backlog_cleanup = (
+        project_status == backlog_status and assigned_to_current_user
+    )
 
     errors: list[str] = []
     exclusions: list[str] = []
-    if "ready-for-agent" not in labels:
+    if "ready-for-agent" not in labels and not recovering_backlog_cleanup:
         exclusions.append("missing ready-for-agent label")
 
     planning_transition = parse_transition(
@@ -308,31 +509,23 @@ def analyze_ticket(
             f"{planning_transition['actor']!r} is not approved",
         )
 
-    implementation_plan = ticket["implementationPlan"]
+    implementation_plans, implementation_plan = parse_implementation_plan_chain(
+        ticket,
+        number,
+    )
+    ticket = {
+        **ticket,
+        "implementationPlan": implementation_plan,
+        "implementationPlans": implementation_plans,
+    }
     plan_is_usable = False
     plan_is_current_in_planning = False
+    plan_published_at: datetime | None = None
     plan_updated_at: datetime | None = None
     if implementation_plan is not None:
-        if not isinstance(implementation_plan, dict):
-            raise InputError(
-                f"ticket {number}: implementationPlan must be an object or null",
-            )
-        for field in (
-            "commentId",
-            "permalink",
-            "author",
-            "digest",
-            "plannedBranch",
-            "plannedSha",
-        ):
-            nonempty_string(
-                implementation_plan.get(field),
-                f"implementationPlan.{field}",
-                number,
-            )
-        plan_created_at = timestamp(
-            implementation_plan.get("createdAt"),
-            "implementationPlan.createdAt",
+        plan_published_at = timestamp(
+            implementation_plan.get("publishedAt"),
+            "implementationPlan.publishedAt",
             number,
         )
         plan_updated_at = timestamp(
@@ -340,11 +533,6 @@ def analyze_ticket(
             "implementationPlan.updatedAt",
             number,
         )
-        if plan_updated_at < plan_created_at:
-            raise InputError(
-                f"ticket {number}: implementationPlan.updatedAt "
-                "precedes implementationPlan.createdAt",
-            )
         plan_targets_base = implementation_plan["plannedBranch"] == base_branch
         plan_authored_by_runner = implementation_plan["author"] == current_user
         if not plan_targets_base and project_status != planning_status:
@@ -363,9 +551,32 @@ def analyze_ticket(
             and plan_authored_by_runner
         )
         plan_is_current_in_planning = (
-            plan_updated_at >= planning_transition["createdAt"]
+            plan_published_at >= planning_transition["createdAt"]
             and plan_is_usable
         )
+        foreign_plan_authors = sorted(
+            {
+                plan["author"]
+                for plan in implementation_plans
+                if plan["author"] != current_user
+            },
+        )
+        if foreign_plan_authors and plan_authored_by_runner:
+            exclusions.append(
+                "implementation plan history authors "
+                f"{foreign_plan_authors} do not match current user {current_user!r}",
+            )
+
+    replan_request = (
+        parse_replan_request(ticket.get("replanRequest"), number)
+        if ticket.get("replanRequest") is not None
+        else None
+    )
+    backlog_transition = (
+        parse_transition(ticket.get("backlogTransition"), "backlogTransition", number)
+        if ticket.get("backlogTransition") is not None
+        else None
+    )
 
     valid_ready_handoff = False
     ready_transition = (
@@ -382,21 +593,80 @@ def analyze_ticket(
         and not ready_transition["wasAutomated"]
         and ready_transition["actor"] == current_user
     )
-    ready_follows_plan = (
-        ready_transition is not None
-        and plan_updated_at is not None
-        and ready_transition["createdAt"] >= plan_updated_at
+    prior_plan = implementation_plan
+    if replan_request is not None:
+        prior_plan = next(
+            (
+                plan for plan in implementation_plans
+                if (
+                    plan["permalink"]
+                    == replan_request["previousPlanPermalink"]
+                    and plan["digest"] == replan_request["previousPlanDigest"]
+                )
+            ),
+            None,
+        )
+    prior_plan_published_at = (
+        timestamp(
+            prior_plan.get("publishedAt"),
+            "implementationPlan.publishedAt",
+            number,
+        )
+        if prior_plan is not None
+        else None
+    )
+    prior_plan_is_usable = (
+        prior_plan is not None
+        and prior_plan["plannedBranch"] == base_branch
+        and prior_plan["author"] == current_user
     )
     valid_prior_ready_handoff = (
         ready_has_runner_provenance
-        and ready_follows_plan
-        and plan_is_usable
+        and ready_transition is not None
+        and prior_plan_published_at is not None
+        and ready_transition["createdAt"] >= prior_plan_published_at
+        and prior_plan_is_usable
         and ready_transition["createdAt"] < planning_transition["createdAt"]
+    )
+    valid_autonomous_replan_report = (
+        replan_request is not None
+        and prior_plan is not None
+        and replan_request["author"] == current_user
+        and replan_request["disposition"] == "autonomous-replan"
+        and ready_transition is not None
+        and replan_request["createdAt"] >= ready_transition["createdAt"]
+        and replan_request["createdAt"] <= planning_transition["createdAt"]
+    )
+    own_pull_requests = [
+        pull_request for pull_request in pull_requests
+        if pull_request["author"] == current_user
+    ]
+    own_closing_pull_requests = [
+        pull_request for pull_request in own_pull_requests
+        if pull_request["closesIssue"]
+    ]
+    retained_pr_matches_report = (
+        replan_request is not None
+        and (
+            (
+                replan_request["pullRequestUrl"] is None
+                and not own_closing_pull_requests
+            )
+            or (
+                len(own_closing_pull_requests) == 1
+                and replan_request["pullRequestUrl"]
+                == own_closing_pull_requests[0]["url"]
+                and replan_request["implementationHeadSha"]
+                == own_closing_pull_requests[0]["headSha"]
+            )
+        )
     )
     planning_is_runner_requeue = (
         project_status == planning_status
         and planning_actor_is_runner
         and valid_prior_ready_handoff
+        and valid_autonomous_replan_report
+        and retained_pr_matches_report
     )
     planning_is_human_authority = (
         planning_actor_is_approver
@@ -417,12 +687,38 @@ def analyze_ticket(
         and not planning_is_runner_requeue
         and not planning_is_human_authority
     ):
-        exclusions.append(
-            "runner Planning requeue lacks a verified prior Ready handoff",
-        )
-    if planning_is_runner_requeue:
-        plan_is_current_in_planning = False
-
+        if not valid_prior_ready_handoff:
+            exclusions.append(
+                "runner Planning requeue lacks a verified prior Ready handoff",
+            )
+        elif not valid_autonomous_replan_report:
+            exclusions.append(
+                "runner Planning requeue lacks a verified replan report",
+            )
+        elif not retained_pr_matches_report:
+            exclusions.append(
+                "runner Planning requeue lacks verified retained PR evidence",
+            )
+    if (
+        planning_is_runner_requeue
+        and plan_is_current_in_planning
+        and implementation_plan is not None
+        and prior_plan is not None
+    ):
+        replan_revisions = [
+            plan for plan in implementation_plans
+            if plan["revision"] > prior_plan["revision"]
+        ]
+        if (
+            not replan_revisions
+            or any(
+                plan["replanRequest"] != replan_request["permalink"]
+                for plan in replan_revisions
+            )
+        ):
+            exclusions.append(
+                "active plan revision does not link the verified replan report",
+            )
     if project_status != planning_status and ready_transition is not None:
         if ready_transition["status"] != ready_status:
             errors.append(
@@ -450,13 +746,22 @@ def analyze_ticket(
             else:
                 valid_ready_handoff = ready_has_runner_provenance
 
-    if str(ticket["state"]).upper() != "OPEN":
+    if (
+        str(ticket["state"]).upper() != "OPEN"
+        and not recovering_backlog_cleanup
+    ):
         exclusions.append("not open")
 
-    if project_status not in (planning_status, ready_status, in_progress_status):
+    if project_status not in (
+        backlog_status,
+        planning_status,
+        ready_status,
+        in_progress_status,
+    ):
         errors.append(
             "expected project status "
-            f"{planning_status!r}, {ready_status!r}, or {in_progress_status!r}, "
+            f"{backlog_status!r}, {planning_status!r}, {ready_status!r}, "
+            f"or {in_progress_status!r}, "
             f"found {project_status!r}",
         )
 
@@ -469,26 +774,63 @@ def analyze_ticket(
         else len(priorities)
     )
 
-    if blockers:
+    if blockers and not recovering_backlog_cleanup:
         exclusions.append(f"blocked by {blockers}")
-    if open_descendants:
+    if open_descendants and not recovering_backlog_cleanup:
         exclusions.append(f"open descendants {open_descendants}")
 
-    assigned_to_current_user = current_user in assignees
     other_assignees = [assignee for assignee in assignees if assignee != current_user]
     if other_assignees:
         exclusions.append(f"assigned to {other_assignees}")
     if project_status == in_progress_status and not assignees:
         exclusions.append("in progress without an assignee")
+    if project_status == backlog_status:
+        if backlog_transition is None:
+            exclusions.append("missing verified Backlog transition")
+        elif backlog_transition["status"] != backlog_status:
+            errors.append(
+                f"latest backlog transition status {backlog_transition['status']!r} "
+                f"does not match {backlog_status!r}",
+            )
+        elif (
+            backlog_transition["wasAutomated"]
+            or backlog_transition["actor"] != current_user
+        ):
+            exclusions.append(
+                "Backlog transition lacks current-runner provenance",
+            )
+        if replan_request is None:
+            exclusions.append("missing verified human-work report")
+        else:
+            if replan_request["author"] != current_user:
+                exclusions.append(
+                    "human-work report author "
+                    f"{replan_request['author']!r} does not match "
+                    f"current user {current_user!r}",
+                )
+            if replan_request["disposition"] != "human-required":
+                exclusions.append(
+                    "Backlog replan report is not marked human-required",
+                )
+            if implementation_plan is not None and (
+                replan_request["previousPlanPermalink"]
+                != implementation_plan["permalink"]
+                or replan_request["previousPlanDigest"]
+                != implementation_plan["digest"]
+            ):
+                exclusions.append(
+                    "human-work report does not identify the current plan",
+                )
+            if (
+                backlog_transition is not None
+                and backlog_transition["createdAt"] < replan_request["createdAt"]
+            ):
+                exclusions.append(
+                    "Backlog transition predates the human-work report",
+                )
+        if not assigned_to_current_user:
+            exclusions.append("human work required in Backlog")
 
-    own_pull_requests = [
-        pull_request for pull_request in pull_requests
-        if pull_request["author"] == current_user
-    ]
-    own_closing_pull_requests = [
-        pull_request for pull_request in own_pull_requests
-        if pull_request["closesIssue"]
-    ]
     wrong_target_pull_requests = [
         pull_request for pull_request in own_closing_pull_requests
         if (
@@ -541,7 +883,9 @@ def analyze_ticket(
             f"{[pull_request['url'] for pull_request in pull_requests]}",
         )
 
-    if project_status == planning_status:
+    if project_status == backlog_status and assigned_to_current_user:
+        action = "resume-backlog-cleanup"
+    elif project_status == planning_status:
         action = (
             "resume-planning-handoff"
             if assigned_to_current_user and plan_is_current_in_planning
@@ -605,6 +949,7 @@ def main() -> int:
                     analyze_ticket(
                         ticket,
                         current_user=args.current_user,
+                        backlog_status=args.backlog_status,
                         planning_status=args.planning_status,
                         ready_status=args.ready_status,
                         in_progress_status=args.in_progress_status,
@@ -624,7 +969,11 @@ def main() -> int:
                     if (
                         isinstance(raw_ticket, dict)
                         and raw_ticket.get("projectStatus")
-                        in (args.planning_status, args.ready_status)
+                        in (
+                            args.backlog_status,
+                            args.planning_status,
+                            args.ready_status,
+                        )
                     ):
                         invalid_planning_claimed.append(invalid)
                     else:
@@ -653,7 +1002,11 @@ def main() -> int:
             if (
                 item["assignedToCurrentUser"]
                 and item["ticket"]["projectStatus"]
-                in (args.planning_status, args.ready_status)
+                in (
+                    args.backlog_status,
+                    args.planning_status,
+                    args.ready_status,
+                )
                 and (item["errors"] or item["exclusions"])
             )
         ]
@@ -664,7 +1017,7 @@ def main() -> int:
         claimed = [item for item in eligible if item["assignedToCurrentUser"]]
         claimed.sort(
             key=lambda item: (
-                item["resumeAction"] not in IMPLEMENTATION_ACTIONS,
+                CLAIM_ACTION_RANK.get(item["resumeAction"], 2),
                 *ticket_rank(item),
             ),
         )
