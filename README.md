@@ -121,6 +121,26 @@ For a taxonomy change, also run the durable
 required references, safeguards, exceptions, and finish gates at the public
 agent-facing seam.
 
+## Evaluating Compose skills
+
+The repository contains a Codex-first advisory evaluator for the six Compose
+skills and their router. It compares a no-plugin baseline, explicit skill
+invocation, and automatic activation across 38 synthetic and provenance-bearing
+cases. Deterministic checks run in CI; authenticated model calls and their
+scores never gate merges or releases.
+
+Validate the harness and preview the full call matrix:
+
+```shell
+npm run evals:validate
+python3 evals/run.py plan \
+  --model gpt-5.6-terra --reasoning medium \
+  --judge-model gpt-5.6-sol --judge-reasoning high
+```
+
+See [`evals/README.md`](evals/README.md) for experiment controls, live execution,
+score formulas, resumability, and human auditing.
+
 ## License
 
 [Apache 2.0](LICENSE)
