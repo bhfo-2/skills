@@ -22,6 +22,8 @@ DEFAULT_PRIORITY_ARGUMENTS = (
 DEFAULT_PROJECT_ARGUMENTS = (
     "--repository",
     "acme/repo",
+    "--configuration-digest",
+    "sha256:config",
     "--base-branch",
     "main",
     "--execution-approver",
@@ -40,6 +42,18 @@ DEFAULT_STATUS_ARGUMENTS = (
     "epic",
     "--human-work-label",
     "ready-for-human",
+)
+DEFAULT_WAYFINDER_ARGUMENTS = (
+    "--wayfinder-map-label",
+    "wayfinder:map",
+    "--wayfinder-research-label",
+    "wayfinder:research",
+    "--wayfinder-prototype-label",
+    "wayfinder:prototype",
+    "--wayfinder-grilling-label",
+    "wayfinder:grilling",
+    "--wayfinder-task-label",
+    "wayfinder:task",
 )
 
 
@@ -66,11 +80,17 @@ def implementation_plan(number: int, **overrides: object) -> dict:
     return result
 
 
-def run_ranker(items: list[dict], *arguments: str) -> tuple[int, dict]:
+def run_ranker(
+    items: list[dict],
+    *arguments: str,
+    mode: str = "drain",
+) -> tuple[int, dict]:
     result = subprocess.run(
         [
             sys.executable,
             str(SCRIPT),
+            "--mode",
+            mode,
             "--current-user",
             "chris",
             *DEFAULT_PROJECT_ARGUMENTS,
@@ -136,6 +156,57 @@ def backlog_ticket(number: int, **overrides: object) -> dict:
     return result
 
 
+def wayfinder_ticket(
+    number: int,
+    *,
+    ticket_type: str = "research",
+    **overrides: object,
+) -> dict:
+    result = ticket(
+        number,
+        projectStatus="Planning",
+        labels=[f"wayfinder:{ticket_type}"],
+        planningTransition={
+            "id": f"PVTE_{number}_planning",
+            "actor": "maintainer",
+            "createdAt": "2026-07-28T08:00:00Z",
+            "status": "Planning",
+            "wasAutomated": False,
+        },
+        readyTransition=None,
+        implementationPlan=None,
+        parentIssue={
+            "number": 1,
+            "state": "OPEN",
+            "labels": ["wayfinder:map"],
+        },
+    )
+    result.update(overrides)
+    return result
+
+
+def wayfinder_reconciliation(number: int, **overrides: object) -> dict:
+    result = {
+        "commentId": f"IC_wayfinder_reconciliation_{number}",
+        "permalink": (
+            f"https://github.com/acme/repo/issues/{number}#issuecomment-reconcile"
+        ),
+        "author": "chris",
+        "createdAt": "2026-07-28T09:00:00Z",
+        "markerVersion": 1,
+        "disposition": "resolved",
+        "mapNumber": 1,
+        "projectItemId": f"PVTI_{number}",
+        "outcomePermalink": (
+            f"https://github.com/acme/repo/issues/{number}#issuecomment-resolution"
+        ),
+        "configurationDigest": "sha256:config",
+        "planDigest": f"sha256:wayfinder-{number}",
+    }
+    result.update(overrides)
+    return result
+
+
 def pull_request(number: int, **overrides: object) -> dict:
     result = {
         "number": number,
@@ -185,6 +256,13 @@ def first_entry(output: dict) -> dict:
 
 
 class RankTicketsTest(unittest.TestCase):
+    def test_disabled_wayfinder_preserves_the_existing_output_shape(self) -> None:
+        returncode, output = run_ranker([ticket(199)])
+
+        self.assertEqual(0, returncode)
+        self.assertNotIn("wayfinderHumanFrontier", output)
+        self.assertNotIn("wayfinderClaimedHitl", output)
+
     def test_selects_the_unique_unsuperseded_plan_revision(self) -> None:
         old_permalink = (
             "https://github.com/acme/repo/issues/202#issuecomment-plan-v1"
@@ -1716,6 +1794,528 @@ class RankTicketsTest(unittest.TestCase):
                     "reasons": [
                         "assigned to current user while project status is still ready",
                         "ready transition predates the latest planning authorization",
+                    ],
+                },
+            ],
+            output["blockedPlanningClaims"],
+        )
+
+    def test_ranks_unclaimed_wayfinder_research_in_the_planning_lane(self) -> None:
+        ordinary_planning = ticket(
+            301,
+            projectStatus="Planning",
+            projectPriority="High",
+            projectPosition=30,
+            labels=["ready-for-agent"],
+            readyTransition=None,
+            implementationPlan=None,
+        )
+        wayfinder_research = wayfinder_ticket(
+            302,
+            projectPriority="Critical",
+            projectPosition=40,
+        )
+
+        returncode, output = run_ranker(
+            [ordinary_planning, wayfinder_research],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [302, 301],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+        self.assertEqual(
+            ["wayfind", "plan"],
+            [entry["action"] for entry in output["candidates"]],
+        )
+
+    def test_wayfinder_requires_one_type_an_open_map_and_fresh_human_planning(self) -> None:
+        valid = wayfinder_ticket(303)
+        wrong_parent = wayfinder_ticket(
+            304,
+            parentIssue={
+                "number": 1,
+                "state": "CLOSED",
+                "labels": ["wayfinder:map"],
+            },
+        )
+        ambiguous_type = wayfinder_ticket(
+            305,
+            labels=["wayfinder:research", "wayfinder:task"],
+        )
+        automated = wayfinder_ticket(
+            306,
+            planningTransition={
+                "id": "PVTE_306_planning",
+                "actor": "maintainer",
+                "createdAt": "2026-07-28T08:00:00Z",
+                "status": "Planning",
+                "wasAutomated": True,
+            },
+        )
+
+        returncode, output = run_ranker(
+            [valid, wrong_parent, ambiguous_type, automated],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [303],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+        self.assertEqual(
+            [304, 305, 306],
+            [entry["number"] for entry in output["excluded"]],
+        )
+
+    def test_surfaces_hitl_wayfinder_work_without_blocking_afk_work(self) -> None:
+        research = wayfinder_ticket(307, ticket_type="research")
+        afk_task = wayfinder_ticket(
+            308,
+            ticket_type="task",
+            wayfinderTaskMode="afk",
+            wayfinderAfkEvidence="The ticket lists only a safe local inventory command.",
+        )
+        prototype = wayfinder_ticket(309, ticket_type="prototype")
+        ambiguous_task = wayfinder_ticket(310, ticket_type="task")
+        ordinary = ticket(311, projectPriority="Low")
+
+        returncode, output = run_ranker(
+            [ordinary, prototype, ambiguous_task, research, afk_task],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [311, 307, 308],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+        self.assertEqual(
+            [309, 310],
+            [entry["ticket"]["number"] for entry in output["wayfinderHumanFrontier"]],
+        )
+        self.assertEqual([], output["wayfinderClaimedHitl"])
+        self.assertEqual(
+            ["prototype", "task"],
+            [entry["type"] for entry in output["wayfinderHumanFrontier"]],
+        )
+
+    def test_malformed_unclaimed_wayfinder_does_not_block_ordinary_execution(self) -> None:
+        malformed = wayfinder_ticket(
+            312,
+            parentIssue={
+                "number": 1,
+                "state": "OPEN",
+                "labels": [],
+            },
+        )
+        ordinary = ticket(313)
+
+        returncode, output = run_ranker(
+            [malformed, ordinary],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [313],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+        self.assertEqual(
+            [{"number": 312, "reasons": ["parent is not an open Wayfinder map"]}],
+            output["excluded"],
+        )
+
+    def test_map_label_alone_is_not_a_wayfinder_child(self) -> None:
+        map_only = ticket(
+            314,
+            projectStatus="Planning",
+            labels=["wayfinder:map", "ready-for-agent"],
+            readyTransition=None,
+            implementationPlan=None,
+        )
+
+        returncode, output = run_ranker(
+            [map_only],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual([], output["candidates"])
+        self.assertEqual(
+            [
+                {
+                    "number": 314,
+                    "reasons": ["Wayfinder map is not a child candidate"],
+                },
+            ],
+            output["excluded"],
+        )
+
+    def test_preserves_an_assigned_invalid_wayfinder_as_a_planning_blocker(self) -> None:
+        claimed = wayfinder_ticket(
+            315,
+            assignees=["chris"],
+            openDescendants=[316],
+        )
+
+        returncode, output = run_ranker(
+            [claimed],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual([], output["candidates"])
+        self.assertEqual(
+            [{"number": 315, "reasons": ["open descendants ['316']"]}],
+            output["blockedPlanningClaims"],
+        )
+
+    def test_preserves_an_assigned_map_and_child_collision_as_a_planning_blocker(
+        self,
+    ) -> None:
+        collision = wayfinder_ticket(
+            316,
+            assignees=["chris"],
+            labels=["wayfinder:map", "wayfinder:research"],
+        )
+
+        returncode, output = run_ranker(
+            [collision],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [
+                {
+                    "number": 316,
+                    "reasons": ["Wayfinder map cannot carry a child type label"],
+                },
+            ],
+            output["blockedPlanningClaims"],
+        )
+
+    def test_assigned_hitl_wayfinder_is_not_called_frontier_work(self) -> None:
+        assigned_prototype = wayfinder_ticket(
+            317,
+            ticket_type="prototype",
+            assignees=["chris"],
+        )
+        afk_research = wayfinder_ticket(318)
+
+        returncode, output = run_ranker(
+            [assigned_prototype, afk_research],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual([], output["claims"])
+        self.assertEqual(
+            [318],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+        self.assertEqual([], output["wayfinderHumanFrontier"])
+        self.assertEqual(
+            [317],
+            [entry["ticket"]["number"] for entry in output["wayfinderClaimedHitl"]],
+        )
+        self.assertEqual(
+            "resume-wayfinder-hitl",
+            output["wayfinderClaimedHitl"][0]["action"],
+        )
+
+    def test_next_selects_hitl_wayfinder_by_planning_rank(self) -> None:
+        prototype = wayfinder_ticket(
+            319,
+            ticket_type="prototype",
+            projectPriority="Critical",
+        )
+        research = wayfinder_ticket(320, projectPriority="High")
+
+        returncode, output = run_ranker(
+            [research, prototype],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+            mode="next",
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [319, 320],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+        self.assertEqual([], output["wayfinderHumanFrontier"])
+
+    def test_next_honors_an_explicit_wayfinder_ticket_over_project_rank(self) -> None:
+        selected = wayfinder_ticket(324, projectPriority="Low")
+        higher_wayfinder = wayfinder_ticket(325, projectPriority="Critical")
+        ordinary = ticket(326, projectPriority="Critical")
+
+        returncode, output = run_ranker(
+            [ordinary, higher_wayfinder, selected],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+            "--wayfinder-ticket",
+            "324",
+            mode="next",
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(324, output["selectedWayfinderTicket"])
+        self.assertEqual(
+            [324],
+            [entry["ticket"]["number"] for entry in output["candidates"]],
+        )
+
+    def test_explicit_wayfinder_ticket_cannot_bypass_an_existing_claim(self) -> None:
+        selected = wayfinder_ticket(327)
+        existing_claim = ticket(
+            328,
+            projectStatus="In progress",
+            assignees=["chris"],
+        )
+
+        returncode, output = run_ranker(
+            [selected, existing_claim],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+            "--wayfinder-ticket",
+            "327",
+            mode="next",
+        )
+
+        self.assertEqual(2, returncode)
+        self.assertIn("cannot bypass existing claims [328]", output["error"])
+
+    def test_explicit_wayfinder_ticket_is_not_available_in_drain(self) -> None:
+        returncode, output = run_ranker(
+            [wayfinder_ticket(329)],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+            "--wayfinder-ticket",
+            "329",
+        )
+
+        self.assertEqual(2, returncode)
+        self.assertEqual(
+            "an explicit Wayfinder ticket requires next mode",
+            output["error"],
+        )
+
+    def test_explicit_wayfinder_ticket_does_not_fall_back_when_ineligible(self) -> None:
+        selected = wayfinder_ticket(
+            331,
+            blockedBy=[330],
+        )
+        fallback = wayfinder_ticket(332, projectPriority="Critical")
+
+        returncode, output = run_ranker(
+            [fallback, selected],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+            "--wayfinder-ticket",
+            "331",
+            mode="next",
+        )
+
+        self.assertEqual(2, returncode)
+        self.assertIn(
+            "selected Wayfinder ticket 331 is ineligible: blocked by ['330']",
+            output["error"],
+        )
+
+    def test_next_resumes_an_assigned_hitl_wayfinder_claim(self) -> None:
+        prototype = wayfinder_ticket(
+            321,
+            ticket_type="prototype",
+            assignees=["chris"],
+        )
+
+        returncode, output = run_ranker(
+            [prototype],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+            mode="next",
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [321],
+            [entry["ticket"]["number"] for entry in output["claims"]],
+        )
+        self.assertEqual("resume-wayfind", output["claims"][0]["action"])
+
+    def test_resumes_terminal_wayfinder_reconciliation_after_closure(self) -> None:
+        interrupted = wayfinder_ticket(
+            322,
+            assignees=["chris"],
+            state="CLOSED",
+            projectStatus="Done",
+            parentIssue={
+                "number": 1,
+                "state": "CLOSED",
+                "labels": ["wayfinder:map"],
+            },
+            wayfinderReconciliation=wayfinder_reconciliation(322),
+        )
+
+        returncode, output = run_ranker(
+            [interrupted],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [322],
+            [entry["ticket"]["number"] for entry in output["claims"]],
+        )
+        self.assertEqual(
+            "resume-wayfinder-reconciliation",
+            output["claims"][0]["action"],
+        )
+
+    def test_wayfinder_reconciliation_stays_behind_earlier_claim_classes(self) -> None:
+        cleanup = ticket(
+            335,
+            projectStatus="Backlog",
+            projectPriority="Low",
+            assignees=["chris"],
+            replanRequest=replan_request(335, disposition="human-required"),
+            backlogTransition={
+                "id": "PVTE_335_backlog",
+                "actor": "chris",
+                "createdAt": "2026-07-28T12:00:00Z",
+                "status": "Backlog",
+                "wasAutomated": False,
+            },
+        )
+        implementation = ticket(
+            336,
+            projectStatus="In progress",
+            projectPriority="Low",
+            assignees=["chris"],
+        )
+        reconciliation = wayfinder_ticket(
+            337,
+            assignees=["chris"],
+            state="CLOSED",
+            projectStatus="Done",
+            projectPriority="Critical",
+            wayfinderReconciliation=wayfinder_reconciliation(337),
+        )
+
+        returncode, output = run_ranker(
+            [reconciliation, implementation, cleanup],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            [
+                "resume-backlog-cleanup",
+                "resume-implementation",
+                "resume-wayfinder-reconciliation",
+            ],
+            [entry["action"] for entry in output["claims"]],
+        )
+
+    def test_rejects_a_wayfinder_reconciliation_for_another_project_item(self) -> None:
+        interrupted = wayfinder_ticket(
+            323,
+            assignees=["chris"],
+            state="CLOSED",
+            projectStatus="Done",
+            wayfinderReconciliation=wayfinder_reconciliation(
+                323,
+                projectItemId="PVTI_other",
+            ),
+        )
+
+        returncode, output = run_ranker(
+            [interrupted],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual([], output["claims"])
+        self.assertEqual(
+            [
+                {
+                    "number": 323,
+                    "reasons": [
+                        "ticket 323: Wayfinder reconciliation Project item changed",
+                    ],
+                },
+            ],
+            output["blockedPlanningClaims"],
+        )
+
+    def test_accepts_an_out_of_scope_wayfinder_reconciliation(self) -> None:
+        interrupted = wayfinder_ticket(
+            330,
+            assignees=["chris"],
+            wayfinderReconciliation=wayfinder_reconciliation(
+                330,
+                disposition="out-of-scope",
+            ),
+        )
+
+        returncode, output = run_ranker(
+            [interrupted],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual(
+            "resume-wayfinder-reconciliation",
+            output["claims"][0]["action"],
+        )
+
+    def test_rejects_an_unknown_wayfinder_reconciliation_disposition(self) -> None:
+        interrupted = wayfinder_ticket(
+            333,
+            assignees=["chris"],
+            wayfinderReconciliation=wayfinder_reconciliation(
+                333,
+                disposition="invalid",
+            ),
+        )
+
+        returncode, output = run_ranker(
+            [interrupted],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual([], output["claims"])
+        self.assertIn(
+            "wayfinderReconciliation.disposition must be 'resolved' or 'out-of-scope'",
+            output["blockedPlanningClaims"][0]["reasons"][0],
+        )
+
+    def test_blocks_a_wayfinder_reconciliation_from_stale_configuration(self) -> None:
+        interrupted = wayfinder_ticket(
+            334,
+            assignees=["chris"],
+            state="CLOSED",
+            projectStatus="Done",
+            wayfinderReconciliation=wayfinder_reconciliation(
+                334,
+                configurationDigest="sha256:stale-config",
+            ),
+        )
+
+        returncode, output = run_ranker(
+            [interrupted],
+            *DEFAULT_WAYFINDER_ARGUMENTS,
+        )
+
+        self.assertEqual(0, returncode)
+        self.assertEqual([], output["claims"])
+        self.assertEqual(
+            [
+                {
+                    "number": 334,
+                    "reasons": [
+                        "ticket 334: Wayfinder reconciliation configuration changed",
                     ],
                 },
             ],

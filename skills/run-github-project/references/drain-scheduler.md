@@ -46,6 +46,12 @@ Use this scheduler only for `drain`. Keep `next` single-ticket.
    [Epics And Human Frontier](human-frontier.md). They consume neither a slot
    nor agent capacity. Serialize epic closure in the controller lane, surface
    changed human actions immediately, and continue independent work.
+11. Keep configured Wayfinder work in the same single planning lane. Give it
+    one durable controller lease, but start a fresh Wayfinder provider context
+    for each non-research child and never reuse that context for another ticket.
+    A research batch may fan out the required `research` subagents from spare
+    capacity. The controller serializes every Wayfinder assignment, comment,
+    closure, map edit, issue creation, Project addition, and dependency mutation.
 
 ## Parallel Workers And Controller Lane
 
@@ -171,7 +177,11 @@ dispatching the next:
    until the in-flight or active-agent limit is reached.
 8. Start the next ranked `Planning` item with the default-owner capability only
    when the planning lane and active agent capacity are free after maximizing
-   runnable implementation.
+   runnable implementation. An AFK Wayfinder research or task item uses this
+   same step, but each non-research child receives a fresh provider context and
+   research uses the required `research` subagent. Resume a marked Wayfinder
+   reconciliation before new Planning work. Surface unassigned Wayfinder HITL
+   frontier work and assigned HITL attention without dispatching either.
 9. Monitor all remote slots together only when no local or controller action
    remains.
 10. After the authoritative execution-clear predicate in
@@ -179,8 +189,9 @@ dispatching the next:
    unblocked Backlog `needs-triage` item through the triage tail lane.
 
 At startup and after every refreshed query, present the changed human frontier
-packet from [Epics And Human Frontier](human-frontier.md). Never wait for its
-actions while any step above remains runnable.
+packet from [Epics And Human Frontier](human-frontier.md), together with the
+ordered unassigned Wayfinder human frontier and assigned HITL attention. Never
+wait for either while any step above remains runnable.
 
 ### Refresh Gate
 
@@ -344,10 +355,15 @@ eligible labeled item belongs only to the triage tail lane.
 Pass the refresh gate before evaluating the finish state. Finish successfully
 only when the authoritative execution-clear predicate in
 [Backlog Triage Lane](triage-lane.md#dispatch) is satisfied, the complete live
-query has no non-deferred triage candidate after merge reconciliation, and no
-human action remains. Dependency-parked Backlog items do not prevent success;
-report their live blockers. If only human actions remain, return
-`waiting-for-human` through [Epics And Human Frontier](human-frontier.md). If no
+query has no non-deferred triage candidate after merge reconciliation, no
+marked Wayfinder reconciliation claim remains, and no human action, Wayfinder
+human-frontier item, or assigned Wayfinder HITL attention item remains.
+Dependency-parked
+Backlog items do not prevent success; report their live blockers. If only human
+actions, Wayfinder human-frontier items, and/or assigned HITL attention remain,
+return
+`waiting-for-human` through [Epics And Human Frontier](human-frontier.md) and
+the Wayfinder frontier. If no
 runnable work remains but a parked implementation claim, blocked or timed-out
 slot, or incomplete eligible triage item remains, stop with a partial-drain
 report, preserve every affected worktree, branch, PR, assignment, and

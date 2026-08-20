@@ -21,14 +21,31 @@ CLAIM_ACTION_RANK = {
     "resume-backlog-cleanup": 0,
     "resume-pr": 1,
     "resume-implementation": 1,
+    "resume-wayfinder-reconciliation": 2,
 }
-CANDIDATE_ACTION_ORDER = ("resume-pr", "resume-implementation", "plan")
+CANDIDATE_ACTION_RANK = {
+    "resume-pr": 0,
+    "resume-implementation": 1,
+    "plan": 2,
+    "wayfind": 2,
+}
 CANDIDATE_OUTPUT_ACTIONS = {"resume-implementation": "claim"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate claims and rank eligible GitHub Project tickets.",
+    )
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=("next", "drain"),
+        help="Invocation mode; next may select HITL Wayfinder work, drain may not.",
+    )
+    parser.add_argument(
+        "--wayfinder-ticket",
+        type=int,
+        help="Explicit Wayfinder child number selected by the user in next mode.",
     )
     parser.add_argument(
         "--current-user",
@@ -39,6 +56,11 @@ def parse_args() -> argparse.Namespace:
         "--repository",
         required=True,
         help="Configured owner/repository targeted by resumable pull requests.",
+    )
+    parser.add_argument(
+        "--configuration-digest",
+        required=True,
+        help="Digest of the committed Project configuration for recovery leases.",
     )
     parser.add_argument(
         "--base-branch",
@@ -88,6 +110,26 @@ def parse_args() -> argparse.Namespace:
         help="Configured issue label that identifies work a human must perform.",
     )
     parser.add_argument(
+        "--wayfinder-map-label",
+        help="Configured label for an open Wayfinder map parent.",
+    )
+    parser.add_argument(
+        "--wayfinder-research-label",
+        help="Configured label for an AFK Wayfinder research ticket.",
+    )
+    parser.add_argument(
+        "--wayfinder-prototype-label",
+        help="Configured label for a HITL Wayfinder prototype ticket.",
+    )
+    parser.add_argument(
+        "--wayfinder-grilling-label",
+        help="Configured label for a HITL Wayfinder grilling ticket.",
+    )
+    parser.add_argument(
+        "--wayfinder-task-label",
+        help="Configured label for an AFK-or-HITL Wayfinder task ticket.",
+    )
+    parser.add_argument(
         "--priority",
         action="append",
         dest="priorities",
@@ -101,6 +143,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum current-user claims allowed in this run, from 1 to 3.",
     )
     return parser.parse_args()
+
+
+def configured_wayfinder_labels(args: argparse.Namespace) -> dict[str, str] | None:
+    labels = {
+        "map": args.wayfinder_map_label,
+        "research": args.wayfinder_research_label,
+        "prototype": args.wayfinder_prototype_label,
+        "grilling": args.wayfinder_grilling_label,
+        "task": args.wayfinder_task_label,
+    }
+    supplied = [name for name, label in labels.items() if label is not None]
+    if not supplied:
+        return None
+    if len(supplied) != len(labels):
+        missing = sorted(name for name, label in labels.items() if label is None)
+        raise InputError(
+            "Wayfinder labels must be configured together; missing "
+            + ", ".join(missing),
+        )
+    if any(not isinstance(label, str) or not label for label in labels.values()):
+        raise InputError("Wayfinder labels must be non-empty strings")
+    if len(set(labels.values())) != len(labels):
+        raise InputError("Wayfinder labels must be unique")
+    return labels
 
 
 def string_values(values: Any, field: str, number: Any) -> list[str]:
@@ -1053,6 +1119,256 @@ def analyze_backlog_ticket(
     }
 
 
+def parse_wayfinder_parent(
+    ticket: dict[str, Any],
+    *,
+    map_label: str,
+    allow_closed: bool = False,
+) -> int:
+    number = ticket["number"]
+    parent = ticket.get("parentIssue")
+    if not isinstance(parent, dict):
+        raise InputError(f"ticket {number}: missing Wayfinder map parent")
+    parent_number = parent.get("number")
+    if (
+        not isinstance(parent_number, int)
+        or isinstance(parent_number, bool)
+        or parent_number <= 0
+    ):
+        raise InputError(f"ticket {number}: parent issue number must be a positive integer")
+    parent_state = parent.get("state")
+    parent_labels = string_values(
+        parent.get("labels"),
+        "parentIssue.labels",
+        number,
+    )
+    accepted_states = {"OPEN", "CLOSED"} if allow_closed else {"OPEN"}
+    if (
+        str(parent_state).upper() not in accepted_states
+        or map_label not in parent_labels
+    ):
+        raise InputError("parent is not an open Wayfinder map")
+    return parent_number
+
+
+def parse_wayfinder_reconciliation(
+    value: Any,
+    *,
+    number: int,
+    current_user: str,
+    project_item_id: str,
+    configuration_digest: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise InputError(
+            f"ticket {number}: wayfinderReconciliation must be an object or null",
+        )
+    marker_version = value.get("markerVersion")
+    if marker_version != 1 or isinstance(marker_version, bool):
+        raise InputError(
+            f"ticket {number}: wayfinderReconciliation.markerVersion must be 1",
+        )
+    result = {
+        field: nonempty_string(
+            value.get(field),
+            f"wayfinderReconciliation.{field}",
+            number,
+        )
+        for field in (
+            "commentId",
+            "permalink",
+            "author",
+            "disposition",
+            "projectItemId",
+            "outcomePermalink",
+            "configurationDigest",
+            "planDigest",
+        )
+    }
+    result["markerVersion"] = marker_version
+    result["createdAt"] = timestamp(
+        value.get("createdAt"),
+        "wayfinderReconciliation.createdAt",
+        number,
+    )
+    map_number = value.get("mapNumber")
+    if (
+        not isinstance(map_number, int)
+        or isinstance(map_number, bool)
+        or map_number <= 0
+    ):
+        raise InputError(
+            f"ticket {number}: wayfinderReconciliation.mapNumber "
+            "must be a positive integer",
+        )
+    result["mapNumber"] = map_number
+    if result["disposition"] not in ("resolved", "out-of-scope"):
+        raise InputError(
+            f"ticket {number}: wayfinderReconciliation.disposition must be "
+            "'resolved' or 'out-of-scope'",
+        )
+    if result["author"] != current_user:
+        raise InputError(
+            f"ticket {number}: Wayfinder reconciliation marker is not runner-authored",
+        )
+    if result["projectItemId"] != project_item_id:
+        raise InputError(
+            f"ticket {number}: Wayfinder reconciliation Project item changed",
+        )
+    if result["configurationDigest"] != configuration_digest:
+        raise InputError(
+            f"ticket {number}: Wayfinder reconciliation configuration changed",
+        )
+    return result
+
+
+def analyze_wayfinder_ticket(
+    ticket: dict[str, Any],
+    *,
+    current_user: str,
+    planning_status: str,
+    priorities: tuple[str, ...],
+    execution_approvers: tuple[str, ...],
+    configuration_digest: str,
+    wayfinder_map_label: str,
+    wayfinder_child_labels: dict[str, str],
+) -> dict[str, Any]:
+    number = ticket["number"]
+    common = analyze_common_ticket(
+        ticket,
+        priorities,
+        require_execution_pr_fields=False,
+    )
+    assignees = common["assignees"]
+    labels = common["labels"]
+    blockers = common["blockers"]
+    open_descendants = common["openDescendants"]
+    pull_requests = common["pullRequests"]
+    errors = common["errors"]
+    exclusions = common["exclusions"]
+
+    reconciliation = parse_wayfinder_reconciliation(
+        ticket.get("wayfinderReconciliation"),
+        number=number,
+        current_user=current_user,
+        project_item_id=ticket["projectItemId"],
+        configuration_digest=configuration_digest,
+    )
+
+    types = [
+        ticket_type
+        for ticket_type, label in wayfinder_child_labels.items()
+        if label in labels
+    ]
+    if len(types) != 1:
+        raise InputError("expected exactly one Wayfinder type label")
+    ticket_type = types[0]
+    parent_number = parse_wayfinder_parent(
+        ticket,
+        map_label=wayfinder_map_label,
+        allow_closed=reconciliation is not None,
+    )
+
+    assigned_to_current_user = current_user in assignees
+    if reconciliation is not None:
+        if reconciliation["mapNumber"] != parent_number:
+            raise InputError(
+                f"ticket {number}: Wayfinder reconciliation map does not match parent",
+            )
+        if not assigned_to_current_user or len(assignees) != 1:
+            exclusions.append(
+                "Wayfinder reconciliation is not assigned only to current user",
+            )
+        if str(ticket["state"]).upper() not in ("OPEN", "CLOSED"):
+            exclusions.append("Wayfinder reconciliation issue state is unknown")
+        if pull_requests:
+            exclusions.append(
+                "has open implementation PRs "
+                f"{[pull_request['url'] for pull_request in pull_requests]}",
+            )
+        return {
+            "ticket": ticket,
+            "priorityRank": common["priorityRank"],
+            "projectPosition": common["projectPosition"],
+            "assignedToCurrentUser": assigned_to_current_user,
+            "resumeAction": "resume-wayfinder-reconciliation",
+            "wayfinderType": ticket_type,
+            "resolutionMode": "afk",
+            "errors": errors,
+            "exclusions": exclusions,
+        }
+
+    if str(ticket["state"]).upper() != "OPEN":
+        exclusions.append("not open")
+    if ticket["projectStatus"] != planning_status:
+        exclusions.append(f"not in {planning_status!r}")
+    planning_transition = parse_transition(
+        ticket["planningTransition"],
+        "planningTransition",
+        number,
+    )
+    if planning_transition["status"] != planning_status:
+        errors.append(
+            f"latest planning transition status {planning_transition['status']!r} "
+            f"does not match {planning_status!r}",
+        )
+    if planning_transition["wasAutomated"]:
+        exclusions.append("planning transition was automated")
+    elif planning_transition["actor"] not in execution_approvers:
+        exclusions.append(
+            "planning transition actor "
+            f"{planning_transition['actor']!r} is not approved",
+        )
+    other_assignees = [assignee for assignee in assignees if assignee != current_user]
+    if other_assignees:
+        exclusions.append(f"assigned to {other_assignees}")
+    if blockers:
+        exclusions.append(f"blocked by {blockers}")
+    if open_descendants:
+        exclusions.append(f"open descendants {open_descendants}")
+    if pull_requests:
+        exclusions.append(
+            "has open implementation PRs "
+            f"{[pull_request['url'] for pull_request in pull_requests]}",
+        )
+
+    resolution_mode = "afk"
+    if ticket_type in ("prototype", "grilling"):
+        resolution_mode = "hitl"
+    elif ticket_type == "task":
+        task_mode = ticket.get("wayfinderTaskMode")
+        if task_mode in (None, "hitl"):
+            resolution_mode = "hitl"
+        elif task_mode == "afk":
+            evidence = ticket.get("wayfinderAfkEvidence")
+            if not isinstance(evidence, str) or not evidence:
+                raise InputError(
+                    f"ticket {number}: AFK Wayfinder task needs non-empty evidence",
+                )
+        else:
+            raise InputError(
+                f"ticket {number}: wayfinderTaskMode must be 'afk', 'hitl', or null",
+            )
+    elif ticket.get("wayfinderTaskMode") is not None:
+        raise InputError(
+            f"ticket {number}: wayfinderTaskMode applies only to Wayfinder tasks",
+        )
+
+    return {
+        "ticket": ticket,
+        "priorityRank": common["priorityRank"],
+        "projectPosition": common["projectPosition"],
+        "assignedToCurrentUser": assigned_to_current_user,
+        "resumeAction": "resume-wayfind" if assigned_to_current_user else "wayfind",
+        "wayfinderType": ticket_type,
+        "resolutionMode": resolution_mode,
+        "errors": errors,
+        "exclusions": exclusions,
+    }
+
+
 def ticket_rank(item: dict[str, Any]) -> tuple[int, float, int]:
     return (
         item["priorityRank"],
@@ -1074,6 +1390,16 @@ def main() -> int:
         execution_approvers = tuple(args.execution_approvers)
         if len(set(execution_approvers)) != len(execution_approvers):
             raise InputError("execution approvers must be unique")
+        wayfinder_labels = configured_wayfinder_labels(args)
+        wayfinder_child_labels = (
+            {
+                ticket_type: label
+                for ticket_type, label in wayfinder_labels.items()
+                if ticket_type != "map"
+            }
+            if wayfinder_labels is not None
+            else {}
+        )
         statuses = (
             args.backlog_status,
             args.planning_status,
@@ -1092,11 +1418,27 @@ def main() -> int:
             raise InputError("role labels must be non-empty")
         if len(set(role_labels)) != len(role_labels):
             raise InputError("role labels must be unique")
+        if wayfinder_labels is not None and (
+            set(role_labels) & set(wayfinder_labels.values())
+        ):
+            raise InputError("Wayfinder labels cannot overlap existing role labels")
+        if not args.configuration_digest:
+            raise InputError("configuration digest must be a non-empty string")
+        if args.wayfinder_ticket is not None:
+            if args.wayfinder_ticket <= 0:
+                raise InputError("Wayfinder ticket must be a positive integer")
+            if args.mode != "next":
+                raise InputError("an explicit Wayfinder ticket requires next mode")
+            if wayfinder_labels is None:
+                raise InputError(
+                    "an explicit Wayfinder ticket requires Wayfinder configuration",
+                )
         if not 1 <= args.max_claims <= 3:
             raise InputError("max claims must be between 1 and 3")
 
         seen_numbers: set[int] = set()
         execution_analyses: list[dict[str, Any]] = []
+        wayfinder_analyses: list[dict[str, Any]] = []
         backlog_analyses: list[dict[str, Any]] = []
         invalid_unclaimed: list[dict[str, Any]] = []
         invalid_claimed: list[dict[str, Any]] = []
@@ -1107,7 +1449,53 @@ def main() -> int:
                 if ticket["number"] in seen_numbers:
                     raise InputError(f"duplicate ticket number {ticket['number']}")
                 seen_numbers.add(ticket["number"])
-                if (
+                labels = ticket["labels"]
+                has_wayfinder_map_label = (
+                    wayfinder_labels is not None
+                    and isinstance(labels, list)
+                    and wayfinder_labels["map"] in labels
+                )
+                is_wayfinder = (
+                    wayfinder_labels is not None
+                    and isinstance(labels, list)
+                    and any(
+                        label in wayfinder_child_labels.values()
+                        for label in labels
+                        if isinstance(label, str)
+                    )
+                )
+                if has_wayfinder_map_label:
+                    invalid = {
+                        "number": ticket["number"],
+                        "reasons": [
+                            (
+                                "Wayfinder map cannot carry a child type label"
+                                if is_wayfinder
+                                else "Wayfinder map is not a child candidate"
+                            ),
+                        ],
+                    }
+                    if is_wayfinder and has_current_user_assignment(
+                        ticket,
+                        args.current_user,
+                    ):
+                        invalid_planning_claimed.append(invalid)
+                    else:
+                        invalid_unclaimed.append(invalid)
+                elif is_wayfinder:
+                    wayfinder_analyses.append(
+                        analyze_wayfinder_ticket(
+                            ticket,
+                            current_user=args.current_user,
+                            planning_status=args.planning_status,
+                            priorities=priorities,
+                            execution_approvers=execution_approvers,
+                            configuration_digest=args.configuration_digest,
+                            wayfinder_map_label=wayfinder_labels["map"],
+                            wayfinder_child_labels=wayfinder_child_labels,
+                        ),
+                    )
+                elif (
                     ticket["projectStatus"] == args.backlog_status
                     and (
                         not has_current_user_assignment(
@@ -1156,8 +1544,20 @@ def main() -> int:
                     and isinstance(raw_ticket.get("labels"), list)
                     and args.human_work_label in raw_ticket["labels"]
                 )
+                is_wayfinder_claim = (
+                    isinstance(raw_ticket, dict)
+                    and isinstance(raw_ticket.get("labels"), list)
+                    and any(
+                        label in wayfinder_child_labels.values()
+                        for label in raw_ticket["labels"]
+                        if isinstance(label, str)
+                    )
+                    and has_current_user_assignment(raw_ticket, args.current_user)
+                )
                 if is_human_frontier_item:
                     invalid_unclaimed.append(invalid)
+                elif is_wayfinder_claim:
+                    invalid_planning_claimed.append(invalid)
                 elif has_current_user_assignment(raw_ticket, args.current_user):
                     if (
                         isinstance(raw_ticket, dict)
@@ -1208,13 +1608,88 @@ def main() -> int:
                 and (item["errors"] or item["exclusions"])
             )
         ]
+        blocked_planning_claims.extend(
+            {
+                "number": item["ticket"]["number"],
+                "reasons": item["errors"] + item["exclusions"],
+            }
+            for item in wayfinder_analyses
+            if (
+                item["assignedToCurrentUser"]
+                and (item["errors"] or item["exclusions"])
+            )
+        )
 
         eligible = [
             item
             for item in execution_analyses
             if not item["errors"] and not item["exclusions"]
         ]
-        claimed = [item for item in eligible if item["assignedToCurrentUser"]]
+        eligible_wayfinder = [
+            item
+            for item in wayfinder_analyses
+            if not item["errors"] and not item["exclusions"]
+        ]
+
+        selection_pool = [*eligible, *eligible_wayfinder]
+        if args.wayfinder_ticket is not None:
+            selected = [
+                item
+                for item in wayfinder_analyses
+                if item["ticket"]["number"] == args.wayfinder_ticket
+            ]
+            if not selected:
+                raise InputError(
+                    f"selected Wayfinder ticket {args.wayfinder_ticket} "
+                    "is not a configured child contender",
+                )
+            selected_item = selected[0]
+            selected_reasons = selected_item["errors"] + selected_item["exclusions"]
+            if selected_reasons:
+                raise InputError(
+                    f"selected Wayfinder ticket {args.wayfinder_ticket} is ineligible: "
+                    + "; ".join(selected_reasons),
+                )
+            other_claims = list(
+                dict.fromkeys(
+                    [
+                        item["ticket"]["number"]
+                        for item in selection_pool
+                        if item["assignedToCurrentUser"]
+                        and item["ticket"]["number"] != args.wayfinder_ticket
+                    ]
+                    + [
+                        item["number"]
+                        for item in [*blocked_claims, *blocked_planning_claims]
+                        if item["number"] != args.wayfinder_ticket
+                    ],
+                ),
+            )
+            other_claims.sort(
+                key=lambda number: (
+                    (0, number)
+                    if isinstance(number, int) and not isinstance(number, bool)
+                    else (1, str(number))
+                ),
+            )
+            if other_claims:
+                raise InputError(
+                    f"selected Wayfinder ticket {args.wayfinder_ticket} cannot bypass "
+                    f"existing claims {other_claims}",
+                )
+            selection_pool = [selected_item]
+
+        claimed = [
+            item
+            for item in selection_pool
+            if (
+                item["assignedToCurrentUser"]
+                and (
+                    args.mode == "next"
+                    or item.get("resolutionMode", "afk") == "afk"
+                )
+            )
+        ]
         claimed.sort(
             key=lambda item: (
                 CLAIM_ACTION_RANK.get(item["resumeAction"], 2),
@@ -1250,9 +1725,17 @@ def main() -> int:
             return 2
 
         candidates = sorted(
-            (item for item in eligible if not item["assignedToCurrentUser"]),
+            (
+                item
+                for item in selection_pool
+                if not item["assignedToCurrentUser"]
+                and (
+                    args.mode == "next"
+                    or item.get("resolutionMode", "afk") == "afk"
+                )
+            ),
             key=lambda item: (
-                CANDIDATE_ACTION_ORDER.index(item["resumeAction"]),
+                CANDIDATE_ACTION_RANK[item["resumeAction"]],
                 *ticket_rank(item),
             ),
         )
@@ -1263,6 +1746,16 @@ def main() -> int:
                 "reasons": item["errors"] + item["exclusions"],
             }
             for item in execution_analyses
+            if (
+                not item["assignedToCurrentUser"]
+                and (item["errors"] or item["exclusions"])
+            )
+        ] + [
+            {
+                "number": item["ticket"]["number"],
+                "reasons": item["errors"] + item["exclusions"],
+            }
+            for item in wayfinder_analyses
             if (
                 not item["assignedToCurrentUser"]
                 and (item["errors"] or item["exclusions"])
@@ -1304,6 +1797,26 @@ def main() -> int:
         )
         parked_blocked = sorted(
             (item for item in eligible_backlog if item["blockerReasons"]),
+            key=ticket_rank,
+        )
+        wayfinder_human_frontier = sorted(
+            (
+                item
+                for item in eligible_wayfinder
+                if args.mode == "drain"
+                and item["resolutionMode"] == "hitl"
+                and not item["assignedToCurrentUser"]
+            ),
+            key=ticket_rank,
+        )
+        wayfinder_claimed_hitl = sorted(
+            (
+                item
+                for item in eligible_wayfinder
+                if args.mode == "drain"
+                and item["resolutionMode"] == "hitl"
+                and item["assignedToCurrentUser"]
+            ),
             key=ticket_rank,
         )
         output = {
@@ -1358,6 +1871,25 @@ def main() -> int:
             ],
             "excluded": excluded,
         }
+        if wayfinder_labels is not None:
+            output["wayfinderHumanFrontier"] = [
+                {
+                    "ticket": item["ticket"],
+                    "action": "resolve-wayfinder-hitl",
+                    "type": item["wayfinderType"],
+                }
+                for item in wayfinder_human_frontier
+            ]
+            output["wayfinderClaimedHitl"] = [
+                {
+                    "ticket": item["ticket"],
+                    "action": "resume-wayfinder-hitl",
+                    "type": item["wayfinderType"],
+                }
+                for item in wayfinder_claimed_hitl
+            ]
+        if args.wayfinder_ticket is not None:
+            output["selectedWayfinderTicket"] = args.wayfinder_ticket
         print(json.dumps(output, indent=2, sort_keys=True))
         return 0
     except (InputError, json.JSONDecodeError) as error:

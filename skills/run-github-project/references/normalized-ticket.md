@@ -68,6 +68,64 @@ paginated GitHub and Project reads. Use this shape for execution contenders:
 }
 ```
 
+When Wayfinder is enabled, a configured Wayfinder child uses the Planning
+shape above plus its direct parent and, for a task, its controller-derived mode:
+
+```json
+{
+  "parentIssue": {
+    "number": 7,
+    "state": "OPEN",
+    "labels": ["wayfinder:map"]
+  },
+  "labels": ["wayfinder:research"],
+  "readyTransition": null,
+  "implementationPlans": [],
+  "wayfinderTaskMode": null,
+  "wayfinderAfkEvidence": null
+}
+```
+
+The parent must be the direct map parent, not an inferred ancestor. Use exactly
+one configured type label. Research is AFK; prototype and grilling are HITL.
+For a task, use `"afk"` only with non-empty fresh evidence that every action is
+safely autonomous; use `"hitl"` or `null` for a human or ambiguous task.
+Wayfinder children require the schema fields above, but not a Ready transition
+or any implementation-plan entries.
+
+For an interrupted terminal reconciliation, add the normalized authoritative
+marker below. Recovery inventory may supply a closed child, a closed parent,
+and a Project item in Done or archived; it must still use fresh values and the
+exact recorded Project item node ID.
+
+```json
+{
+  "wayfinderReconciliation": {
+    "commentId": "IC_reconciliation",
+    "permalink": "https://github.com/owner/repository/issues/52#issuecomment-2",
+    "author": "octocat",
+    "createdAt": "2026-07-28T09:00:00Z",
+    "markerVersion": 1,
+    "disposition": "resolved",
+    "mapNumber": 7,
+    "projectItemId": "PVTI_example",
+    "outcomePermalink": "https://github.com/owner/repository/issues/52#issuecomment-1",
+    "configurationDigest": "sha256:configuration",
+    "planDigest": "sha256:semantic-reconciliation-plan"
+  }
+}
+```
+
+The comment body retains the full planned-mutation list; the normalized form
+contains the identifiers and digests the ranker validates. The marker must be
+runner-authored, match the child Project item and direct map parent, match the
+`--configuration-digest` passed for this invocation, and remain assigned only
+to that runner. Such a claim returns
+`resume-wayfinder-reconciliation` before new Wayfinder work.
+Use `resolved` only for a decision on the route and `out-of-scope` only for a
+scope disposition. The recorded plan must place their linked gists in
+`Decisions so far` and `Out of scope`, respectively.
+
 Use the same canonical shape for Backlog triage contenders, with transition and
 replan fields set to `null` and `implementationPlans` empty when absent. Backlog
 `openPullRequests` entries need only `number`, `url`, and `closesIssue`; omit
@@ -194,6 +252,12 @@ The ranker returns valid current-user claims and ordered unclaimed candidates:
     {"ticket": {"number": 45}, "action": "claim"},
     {"ticket": {"number": 46}, "action": "plan"}
   ],
+  "wayfinderHumanFrontier": [
+    {"ticket": {"number": 52}, "action": "resolve-wayfinder-hitl", "type": "grilling"}
+  ],
+  "wayfinderClaimedHitl": [
+    {"ticket": {"number": 53}, "action": "resume-wayfinder-hitl", "type": "prototype"}
+  ],
   "triageCandidates": [
     {"ticket": {"number": 47}, "action": "triage"}
   ],
@@ -230,6 +294,25 @@ verified. Triage candidates are ordered separately and run only through
 [Backlog Triage Lane](triage-lane.md). Process ready epics and human actions
 through [Epics And Human Frontier](human-frontier.md); Backlog `parkedBlocked`
 items consume neither a slot nor an agent.
+
+When enabled in `next`, the ranker emits any eligible Wayfinder candidate as
+`wayfind` and an assigned one as `resume-wayfind`. In `drain`, it emits only AFK
+work in those collections and returns configured prototype, grilling, HITL,
+and ambiguous task children in `wayfinderHumanFrontier` only while unassigned,
+ordered by Priority, position, and issue number. It returns assigned eligible
+HITL children separately in `wayfinderClaimedHitl`. A terminal recovery is
+always an assigned `resume-wayfinder-reconciliation` claim. All are Planning
+work and consume no implementation slot. Route every form through
+[Wayfinder Planning Lane](wayfinder-lane.md).
+
+When `--wayfinder-ticket` is present in `next`, the output includes
+`selectedWayfinderTicket` and returns only that child as new work. The ranker
+rejects an absent or ineligible child, use in `drain`, and any selection that
+would bypass another current-user claim.
+
+Every human-facing consumer must render the complete ticket as
+`[title](url)`. The abbreviated number-only objects above illustrate collection
+shape, not permitted narration.
 
 Before invoking the ranker, apply the drain scheduler's
 [Terminal Required-CI Parking](drain-scheduler.md#terminal-required-ci-parking)
