@@ -2,10 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from evals.harness.cases import COMPOSE_SKILLS, ROUTER_SKILL
 from evals.harness.experiment import (
+    _case_digest,
     _judge_packet_path,
     _rejudgment_fingerprint,
     _rejudgment_result_path,
@@ -36,6 +38,7 @@ class ResultLifecycleTest(unittest.TestCase):
     def write_raw_record(self, case: str, arm: str, repetition: int, **overrides):
         payload = {
             "id": f"{case}:{arm}:{repetition}",
+            "suite": "compose",
             "codex_version": "codex-cli 1",
             "skill_sha": "skill-sha",
             "skill_catalog_digest": "catalog-sha",
@@ -85,6 +88,25 @@ class ResultLifecycleTest(unittest.TestCase):
         second = result_fingerprint(**common, skill_catalog_digest="catalog-two")
 
         self.assertNotEqual(first, second)
+
+    def test_case_digest_includes_fixture_but_ignores_generated_outputs(self):
+        case_dir = self.root / "evals" / "cases" / "sample"
+        fixture = self.root / "evals" / "fixtures" / "sample-jvm"
+        case_dir.mkdir(parents=True)
+        fixture.mkdir(parents=True)
+        (case_dir / "prompt.md").write_text("Inspect it.\n", encoding="utf-8")
+        source = fixture / "Fixture.kt"
+        source.write_text("class Fixture\n", encoding="utf-8")
+        case = SimpleNamespace(directory=case_dir, fixture="sample-jvm")
+
+        original = _case_digest(case)
+        source.write_text("class ChangedFixture\n", encoding="utf-8")
+        changed = _case_digest(case)
+        (fixture / "build").mkdir()
+        (fixture / "build" / "generated.bin").write_bytes(b"generated")
+
+        self.assertNotEqual(original, changed)
+        self.assertEqual(changed, _case_digest(case))
 
     def test_judge_packet_paths_are_unique_across_arms_without_disclosing_them(self):
         common = {
@@ -328,6 +350,29 @@ class ResultLifecycleTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "different run controls: subject_model"):
+            load_raw_records(self.root)
+
+    def test_loading_raw_records_defaults_legacy_results_to_compose(self):
+        self.write_raw_record("legacy", "automatic", 1)
+        path = self.root / "raw" / "legacy" / "automatic" / "1.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        del document["payload"]["suite"]
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        record = load_raw_records(self.root)[0]
+
+        self.assertEqual("compose", record["suite"])
+
+    def test_loading_raw_records_rejects_mixed_suites(self):
+        self.write_raw_record("first", "automatic", 1)
+        self.write_raw_record(
+            "second",
+            "automatic",
+            1,
+            suite="kotlin-gradle",
+        )
+
+        with self.assertRaisesRegex(ValueError, "different run controls: suite"):
             load_raw_records(self.root)
 
     def test_loading_raw_records_rejects_malformed_payloads(self):
