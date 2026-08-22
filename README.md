@@ -2,7 +2,8 @@
 
 # Skills
 
-A set of skills for Kotlin, Jetpack Compose, and Android development.
+A set of skills for Kotlin, Jetpack Compose, Android development, and grounded
+writing.
 
 ## Install
 
@@ -73,6 +74,10 @@ See [`.opencode/INSTALL.md`](.opencode/INSTALL.md) for details.
 - [`kotlin-concurrency-and-flow`](skills/kotlin-concurrency-and-flow/SKILL.md) — review coroutine ownership, cancellation, Flow state/event modeling, sharing, replay, and one-shot delivery.
 - [`kotlin-control-flow`](skills/kotlin-control-flow/SKILL.md) — write and review Kotlin branching with subject `when`, guard conditions, sealed exhaustiveness, smart casts, nullable branching, and early returns.
 - [`kotlin-api-design`](skills/kotlin-api-design/SKILL.md) — choose function owners, semantic domain types, and Kotlin Multiplatform platform boundaries.
+
+### Writing
+
+- [`grounded-writing`](skills/grounded-writing/SKILL.md) — draft or revise substantial prose in Chris Banes's evidence-led, conversational voice without inventing personal claims.
 
 ### Workflows
 
