@@ -15,6 +15,7 @@ from evals.harness.codex import (
     RunConfig,
     SubjectResult,
     discover_skill_paths,
+    is_generated_skill_path,
     reported_skill_names,
     run_subject,
     subject_output_valid,
@@ -179,6 +180,7 @@ def _skill_source_paths(repo_root: Path) -> tuple[Path, ...]:
                 for skill_dir in skill_dirs
                 for path in skill_dir.rglob("*")
                 if path.is_file()
+                and not is_generated_skill_path(path, skill_dir)
             ),
             key=str,
         )
