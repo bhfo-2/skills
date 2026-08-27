@@ -5,8 +5,9 @@ import math
 import random
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+from evals.harness.codex import completed_tool_call_count
 from evals.harness.score import Scorecard
 from evals.harness.suites import SUITES
 
@@ -55,6 +56,47 @@ def _percent(value: float | None) -> str:
     return "not met" if value is None else f"{value * 100:.1f}%"
 
 
+def _measurement(value: float | None, *, suffix: str = "") -> str:
+    if value is None:
+        return "unavailable"
+    rendered = f"{value:.1f}"
+    return f"{rendered}{suffix}"
+
+
+def _count(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    return str(int(value)) if value.is_integer() else f"{value:.1f}"
+
+
+def _tokens(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    if abs(value) < 1000:
+        return _count(value)
+    return f"{value / 1000:.1f}k"
+
+
+def _seconds(value: float | None) -> str:
+    return _measurement(value, suffix="s")
+
+
+def _total(value: int | None) -> str:
+    return "unavailable" if value is None else str(value)
+
+
+def _comparison(
+    baseline: float | None,
+    automatic: float | None,
+    formatter: Callable[[float | None], str],
+) -> str:
+    if baseline is None or automatic is None or baseline == 0:
+        change = "n/a"
+    else:
+        change = f"{(automatic - baseline) / baseline:+.0%}"
+    return f"{formatter(baseline)} → {formatter(automatic)} ({change})"
+
+
 def _outcome_rate(records: list[dict[str, Any]], arm: str) -> float | None:
     selected = [record for record in records if record.get("arm") == arm]
     if not selected:
@@ -82,20 +124,40 @@ def _per_arm_record_count(records: list[dict[str, Any]]) -> str:
     return ", ".join(f"{arm}={count}" for arm, count in counts.items())
 
 
-def _tool_event_count(records: Iterable[dict[str, Any]]) -> int:
+def _role_attempts(
+    record: dict[str, Any], role: str
+) -> list[dict[str, Any]] | None:
+    payload = record.get(role)
+    if not isinstance(payload, dict):
+        return []
+    attempts = payload.get("attempts")
+    if attempts is not None:
+        if isinstance(attempts, list) and attempts and all(
+            isinstance(attempt, dict) for attempt in attempts
+        ):
+            return attempts
+        return None
+    retries = payload.get("retries", 0)
+    if isinstance(retries, int) and not isinstance(retries, bool) and retries > 0:
+        return None
+    return [payload]
+
+
+def _tool_event_count(records: Iterable[dict[str, Any]]) -> int | None:
     count = 0
     for record in records:
         for role in ("subject", "judge"):
-            for event in record.get(role, {}).get("events", []):
-                if not isinstance(event, dict) or event.get("type") != "item.completed":
+            attempts = _role_attempts(record, role)
+            if attempts is None:
+                return None
+            for attempt in attempts:
+                tool_calls = attempt.get("tool_calls")
+                if isinstance(tool_calls, int) and not isinstance(tool_calls, bool):
+                    count += tool_calls
                     continue
-                item = event.get("item", {})
-                if item.get("type") in {
-                    "command_execution",
-                    "mcp_tool_call",
-                    "tool_call",
-                }:
-                    count += 1
+                events = attempt.get("events", [])
+                if isinstance(events, list):
+                    count += completed_tool_call_count(events)
     return count
 
 
@@ -103,30 +165,48 @@ def render_scorecard(
     score: Scorecard, records: Iterable[dict[str, Any]] = ()
 ) -> str:
     records = list(records)
-    input_tokens = sum(
-        int(record.get(role, {}).get("usage", {}).get("input_tokens", 0))
+    attempt_groups = [
+        _role_attempts(record, role)
         for record in records
         for role in ("subject", "judge")
+    ]
+    attempts_complete = all(attempts is not None for attempts in attempt_groups)
+    attempts = [
+        attempt
+        for group in attempt_groups
+        if group is not None
+        for attempt in group
+    ]
+    input_tokens = (
+        sum(
+            int(attempt.get("usage", {}).get("input_tokens", 0))
+            for attempt in attempts
+        )
+        if attempts_complete
+        else None
     )
-    output_tokens = sum(
-        int(record.get(role, {}).get("usage", {}).get("output_tokens", 0))
-        for record in records
-        for role in ("subject", "judge")
+    output_tokens = (
+        sum(
+            int(attempt.get("usage", {}).get("output_tokens", 0))
+            for attempt in attempts
+        )
+        if attempts_complete
+        else None
     )
-    elapsed = sum(
-        float(record.get(role, {}).get("elapsed_seconds", 0.0))
-        for record in records
-        for role in ("subject", "judge")
+    elapsed = (
+        sum(float(attempt.get("elapsed_seconds", 0.0)) for attempt in attempts)
+        if attempts_complete
+        else None
     )
     retries = sum(
         int(record.get(role, {}).get("retries", 0))
         for record in records
         for role in ("subject", "judge")
     )
-    process_failures = sum(
-        int(record.get(role, {}).get("returncode", 0) != 0)
-        for record in records
-        for role in ("subject", "judge")
+    process_failures = (
+        sum(int(attempt.get("returncode", 0) != 0) for attempt in attempts)
+        if attempts_complete
+        else None
     )
     suites = {str(record.get("suite")) for record in records if record.get("suite")}
     suite_name = (
@@ -204,13 +284,71 @@ def render_scorecard(
             f"- Router reported in automatic arm: {_percent(score.router_report_rate)}",
             f"- Forbidden-action failures: {score.forbidden_action_failures}",
             "",
-            "## Diagnostics (non-gating)",
+            "## Efficiency (non-gating)",
             "",
-            f"- Input tokens: {input_tokens}",
-            f"- Output tokens: {output_tokens}",
-            f"- Tool events: {_tool_event_count(records)}",
-            f"- Elapsed time: {elapsed:.1f}s",
-            f"- Process failures: {process_failures}",
+            "Subject-only metrics. Medians describe a typical run, including any retry. "
+            "Per-pass totals include failed runs, so a quick incorrect result is not rewarded.",
+            "",
+            "| Arm | Passes / runs | Tokens / run | Tool calls / run | Turns / run | Time / run | Tokens / pass | Tool calls / pass | Turns / pass | Time / pass |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for arm in ("none", "forced", "automatic"):
+        efficiency = score.efficiency[arm]
+        lines.append(
+            f"| {arm} | {efficiency.outcome_passes} / {efficiency.runs} | "
+            f"{_tokens(efficiency.median_tokens_per_run)} | "
+            f"{_count(efficiency.median_tool_calls_per_run)} | "
+            f"{_count(efficiency.median_turns_per_run)} | "
+            f"{_seconds(efficiency.median_elapsed_seconds_per_run)} | "
+            f"{_tokens(efficiency.tokens_per_outcome_pass)} | "
+            f"{_count(efficiency.tool_calls_per_outcome_pass)} | "
+            f"{_count(efficiency.turns_per_outcome_pass)} | "
+            f"{_seconds(efficiency.elapsed_seconds_per_outcome_pass)} |"
+        )
+    measured_skills = [
+        (skill, by_arm)
+        for skill, by_arm in sorted(score.skill_efficiency.items())
+        if by_arm["none"].runs or by_arm["automatic"].runs
+    ]
+    if measured_skills:
+        lines.extend(
+            [
+                "",
+                "## Per-skill efficiency (baseline vs automatic)",
+                "",
+                "Subject-only per-run medians, baseline → automatic. Parentheses "
+                "show the automatic change from baseline. Multi-skill scenarios "
+                "contribute to every targeted skill row.",
+                "",
+                "| Skill | Tokens / run | Tool calls / run | Turns / run | Time / run |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for skill, by_arm in measured_skills:
+            baseline = by_arm["none"]
+            automatic = by_arm["automatic"]
+            lines.append(
+                f"| `{skill}` | "
+                f"{_comparison(baseline.median_tokens_per_run, automatic.median_tokens_per_run, _tokens)} | "
+                f"{_comparison(baseline.median_tool_calls_per_run, automatic.median_tool_calls_per_run, _count)} | "
+                f"{_comparison(baseline.median_turns_per_run, automatic.median_turns_per_run, _count)} | "
+                f"{_comparison(baseline.median_elapsed_seconds_per_run, automatic.median_elapsed_seconds_per_run, _seconds)} |"
+            )
+    lines.extend(
+        [
+            "",
+            "Token counts are Codex input plus output tokens. Tool calls count completed "
+            "command, file-change, MCP, web-search, and generic tool events. Wall-clock "
+            "time is environment-sensitive.",
+            "",
+            "## Evaluation diagnostics (non-gating)",
+            "",
+            f"- Input tokens: {_total(input_tokens)}",
+            f"- Output tokens: {_total(output_tokens)}",
+            f"- Tool events: {_total(_tool_event_count(records))}",
+            f"- Elapsed time: {_seconds(elapsed)}",
+            f"- Process failures: {_total(process_failures)}",
             f"- Retries: {retries}",
             "",
             "## Gates",

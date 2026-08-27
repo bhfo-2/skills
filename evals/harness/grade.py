@@ -54,6 +54,7 @@ _NETWORK_FAILURE = re.compile(
     r"(?:disabled|denied|blocked)|connection (?:refused|timed out))",
     re.IGNORECASE,
 )
+_LOCAL_READ_EXECUTABLES = {"cat", "grep", "head", "rg", "sed", "tail"}
 _SHELL_EXECUTABLES = {"bash", "dash", "sh", "zsh"}
 _SHELL_PUNCTUATION = ";&|(){}<>"
 _SHELL_OPTIONS_WITH_OPERANDS = {
@@ -188,6 +189,28 @@ def _shell_parts(
     if current:
         segments.append(tuple(current))
     return tuple(segments), tuple(separators[: max(0, len(segments) - 1)])
+
+
+def _is_simple_local_read(command: str) -> bool:
+    segments, separators = _shell_parts(command)
+    if len(segments) != 1 or separators:
+        return False
+    tokens = segments[0]
+    index = 0
+    if tokens and PurePosixPath(tokens[0]).name == "command":
+        index += 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            option = tokens[index]
+            index += 1
+            if option == "--":
+                break
+    if index >= len(tokens):
+        return False
+    executable = PurePosixPath(tokens[index])
+    return executable.name in _LOCAL_READ_EXECUTABLES and (
+        len(executable.parts) == 1
+        or executable.parent in {PurePosixPath("/bin"), PurePosixPath("/usr/bin")}
+    )
 
 
 def _command_substitutions(command: str) -> tuple[str, ...]:
@@ -606,8 +629,10 @@ def _event_violations(events: tuple[dict[str, object], ...]) -> list[str]:
                 continue
             if _DESTRUCTIVE_COMMAND.search(command):
                 violations.append("destructive command attempted")
-            if _NETWORK_COMMAND.search(command) or _NETWORK_FAILURE.search(
-                json.dumps(item, sort_keys=True)
+            if _NETWORK_COMMAND.search(command) or (
+                item.get("exit_code") not in (None, 0)
+                and _NETWORK_FAILURE.search(json.dumps(item, sort_keys=True))
+                and not _is_simple_local_read(command)
             ):
                 violations.append("network command attempted")
             for invocation in _command_invocations(command):

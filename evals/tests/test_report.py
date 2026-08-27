@@ -69,6 +69,9 @@ class ReportTest(unittest.TestCase):
             ),
         ]
         for item in records:
+            subject_input_tokens = (
+                61774 if item["arm"] == "automatic" else 43198
+            )
             item.update({
                 "suite": "compose",
                 "target_skills": ["compose-state-and-effects"],
@@ -76,10 +79,16 @@ class ReportTest(unittest.TestCase):
                 "judge_pass": item["outcome_pass"],
                 "repetition": 1,
                 "subject": {
-                    "usage": {"input_tokens": 10, "output_tokens": 2},
-                    "events": [{"type": "item.completed", "item": {"type": "command_execution"}}],
+                    "usage": {
+                        "input_tokens": subject_input_tokens,
+                        "output_tokens": 2,
+                    },
+                    "events": [
+                        {"type": "item.completed", "item": {"type": "command_execution"}},
+                        {"type": "turn.completed"},
+                    ],
                     "elapsed_seconds": 1.5,
-                    "retries": 1,
+                    "retries": 0,
                     "returncode": 0,
                 },
                 "judge": {
@@ -107,11 +116,69 @@ class ReportTest(unittest.TestCase):
             self.assertIn("Reported automatic routing precision", markdown)
             self.assertIn("Per-skill diagnostics", markdown)
             self.assertIn("`compose-state-and-effects`", markdown)
-            self.assertIn("Input tokens: 42", markdown)
+            self.assertIn("Efficiency (non-gating)", markdown)
+            self.assertIn(
+                "Per-skill efficiency (baseline vs automatic)", markdown
+            )
+            self.assertIn(
+                "| `compose-state-and-effects` | 43.2k → 61.8k (+43%) | 1 → 1 (+0%) | 1 → 1 (+0%) | 1.5s → 1.5s (+0%) |",
+                markdown,
+            )
+            self.assertNotIn("| Skill | Total tokens", markdown)
+            self.assertIn(
+                "| forced | 1 / 1 | 43.2k | 1 | 1 | 1.5s | 43.2k | 1 | 1 | 1.5s |",
+                markdown,
+            )
+            self.assertIn(
+                "| none | 0 / 1 | 43.2k | 1 | 1 | 1.5s | unavailable | unavailable | unavailable | unavailable |",
+                markdown,
+            )
+            self.assertIn("Input tokens: 148182", markdown)
             self.assertIn("Output tokens: 9", markdown)
             self.assertIn("Tool events: 6", markdown)
-            self.assertIn("Retries: 3", markdown)
+            self.assertIn("Retries: 0", markdown)
             self.assertEqual(markdown, render_scorecard(score, records))
+
+    def test_legacy_retry_diagnostics_are_unavailable_without_attempts(self):
+        item = record(
+            "one:automatic",
+            "automatic",
+            True,
+            expected=("compose-state-and-effects",),
+        )
+        item.update(
+            {
+                "suite": "compose",
+                "subject": {
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                    "events": [
+                        {
+                            "type": "item.completed",
+                            "item": {"type": "command_execution"},
+                        }
+                    ],
+                    "elapsed_seconds": 1.5,
+                    "retries": 1,
+                    "returncode": 0,
+                },
+                "judge": {
+                    "usage": {"input_tokens": 20, "output_tokens": 2},
+                    "events": [],
+                    "elapsed_seconds": 0.5,
+                    "retries": 0,
+                    "returncode": 0,
+                },
+            }
+        )
+
+        markdown = render_scorecard(compute_scorecard([item]), [item])
+
+        self.assertIn("Input tokens: unavailable", markdown)
+        self.assertIn("Output tokens: unavailable", markdown)
+        self.assertIn("Tool events: unavailable", markdown)
+        self.assertIn("Elapsed time: unavailable", markdown)
+        self.assertIn("Process failures: unavailable", markdown)
+        self.assertIn("Retries: 1", markdown)
 
     def test_per_skill_restraint_groups_negative_controls_by_target(self):
         records = [
