@@ -4,13 +4,13 @@ This directory contains a reproducible, advisory evaluator with a shared core
 and suite-specific catalogs, fixtures, coverage rules, and safety policies. It
 tests concrete scenarios modelled on real-world coding work, with expected
 outcomes, allowed-write boundaries, and no-change controls. The committed suites
-cover six Compose skills, four Kotlin/Gradle skills, and four workflow/writing
+cover six Compose skills, four Kotlin/Gradle skills, and five workflow/writing
 skills: `grounded-writing`, `implement-with-subagents`,
-`run-github-project`, and `shepherd`. It is designed to answer three separate
-questions:
+`run-github-project`, `shepherd`, and `to-plan`. It is designed to answer three
+separate questions:
 
 1. Does a skill improve the correctness and restraint of the resulting work?
-2. Does automatic activation report the expected public skill entrypoints?
+2. Does automatic activation report the expected implicitly invokable public skill entrypoints?
 3. What subject-side token, tool-call, and wall-clock cost does each arm require?
 
 The evaluator never turns a stochastic model score into a merge or release
@@ -29,11 +29,13 @@ corpus, and execution conditions are held constant.
 
 ## Results
 
-**Baseline** is the positive-case pass rate with no skills available.
-**Automatic** is the positive-case pass rate with every repository skill
-available but none named in the prompt. **Restraint** is the no-change-control
-pass rate: the skill may inspect the task, but must not make an unnecessary
-change. The table reports the latest available result for each skill and
+**Baseline** is the positive-case pass rate with no skills available, restricted
+to cases eligible for automatic activation. **Automatic** is the matching
+positive-case pass rate with every implicitly invokable repository skill
+available but none named in the prompt. Explicit-only skills are measured only
+in forced runs, including their no-change controls. **Restraint** is the
+no-change-control pass rate: the skill may inspect the task, but must not make
+an unnecessary change. The table reports the latest available result for each skill and
 correctness metric. These scores were produced using
 [`gpt-5.6-terra`](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
 with medium reasoning, judged by
@@ -58,18 +60,20 @@ suite-wide aggregate.
 | `kotlin-concurrency-and-flow` | 33.3% | 100.0% | 100.0% |
 | `kotlin-control-flow` | 27.8% | 100.0% | 100.0% |
 | `grounded-writing` | — | 100.0% | 100.0% |
-| `implement-with-subagents` | — | 100.0% | 100.0% |
-| `run-github-project` | — | 100.0% | 100.0% |
-| `shepherd` | — | 100.0% | 100.0% |
+| `implement-with-subagents` | — | — | 100.0% |
+| `run-github-project` | — | — | 100.0% |
+| `shepherd` | — | — | 100.0% |
+| `to-plan` | — | — | — |
 
 ### Skill efficiency
 
 Values are per-run medians, baseline → automatic, followed by the automatic
 percentage change. These subject-only measurements use the latest complete,
 same-run evidence available for each suite and include failed runs and negative
-controls. Multi-skill scenarios contribute to every targeted skill row. A turn
-is one completed Codex turn; time remains environment-sensitive. The source
-runs, selection rules, and detailed scorecards are in the
+controls. Baseline-to-automatic efficiency comparisons use only cases eligible
+for automatic activation. Multi-skill scenarios contribute to every targeted
+skill row. A turn is one completed Codex turn; time remains environment-sensitive.
+The source runs, selection rules, and detailed scorecards are in the
 [evaluation change record](artifacts/2026-08-27-skill-eval-efficiency.md).
 
 | Skill | Tokens / run | Tool calls / run | Turns / run | Time / run |
@@ -85,9 +89,6 @@ runs, selection rules, and detailed scorecards are in the
 | `kotlin-concurrency-and-flow` | 72.7k → 119.2k (+64%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 46.0s → 64.2s (+40%) |
 | `kotlin-control-flow` | 71.8k → 109.6k (+53%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 39.1s → 53.7s (+37%) |
 | `grounded-writing` | 41.3k → 65.4k (+59%) | 2 → 3 (+50%) | 1 → 1 (+0%) | 16.2s → 26.9s (+66%) |
-| `implement-with-subagents` | 40.9k → 50.9k (+24%) | 2 → 2 (+0%) | 1 → 1 (+0%) | 23.7s → 25.9s (+9%) |
-| `run-github-project` | 41.6k → 59.0k (+42%) | 2 → 3 (+50%) | 1 → 1 (+0%) | 25.0s → 24.1s (-3%) |
-| `shepherd` | 51.8k → 74.3k (+43%) | 3 → 4 (+33%) | 1 → 1 (+0%) | 21.8s → 30.2s (+38%) |
 
 ## Evaluation setup
 
@@ -102,15 +103,16 @@ Every case runs in a fresh workspace and conversation under three arms:
 - `forced` enables and explicitly invokes only the case's target skill or
   skills. Negative controls still force the target so over-application remains
   observable.
-- `automatic` enables all 16 public repository skills without naming any skill
-  in the task prompt. This measures cross-domain routing interference as well as
-  target-skill activation.
+- `automatic` enables every public repository skill whose frontmatter and
+  metadata permit implicit invocation, without naming a skill in the task prompt. This measures
+  cross-domain routing interference and automatic target-skill activation.
 
-Each `case × arm` condition runs three times by default. The 38-case Compose
-suite schedules 342 subject calls and 342 blinded judge calls. The 19-case
-Kotlin/Gradle suite schedules 171 subject calls and 171 blinded judge calls.
-The 12-case workflows/writing suite schedules 108 subject calls and 108 blinded
-judge calls.
+Each eligible `case × arm` condition runs three times by default. A case that
+targets no implicitly invokable skill is excluded from the automatic arm before
+execution. The 38-case Compose suite schedules 342 subject calls and 342
+blinded judge calls. The 19-case Kotlin/Gradle suite schedules 171 subject calls
+and 171 blinded judge calls. The 15-case workflows/writing suite schedules 99
+subject calls and 99 blinded judge calls.
 
 All subject and judge processes use `--ignore-user-config`, explicit
 `skills.config` entries, network-disabled sandboxes, disabled hosted web search,
@@ -165,8 +167,8 @@ The Kotlin/Gradle benchmark contains 19 scored cases:
 - three immutable public-source snapshots across API, Flow, and control-flow
   concerns.
 
-The workflows/writing benchmark contains 12 scored cases: direct, novel, and
-no-change coverage for each of its four skills. Its GitHub-style cases use
+The workflows/writing benchmark contains 15 scored cases: direct, novel, and
+no-change coverage for each of its five skills. Its GitHub-style cases use
 supplied immutable state and rubric plus forbidden-action grading; they do not
 contact a provider. Only `implement-with-subagents` declares the evaluator-owned
 `implement` fixture dependency, because that prerequisite is constant across its
@@ -289,6 +291,10 @@ python3 evals/run.py judge \
   --output-dir .scratch/skill-evals/<run-id> \
   --judge-model gpt-5.6-sol --judge-reasoning high
 ```
+
+It reconciles raw records with the current corpus first, then plans and
+rejudges only measured packets; automatic records that are now ineligible are
+left untouched.
 
 After all rejudgments complete, build a separate scorecard that combines those
 verdicts with the immutable subject and deterministic-grading evidence:

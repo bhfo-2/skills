@@ -17,6 +17,7 @@ from evals.harness.experiment import (
     experiment_plan,
     filter_cases,
     load_raw_records,
+    reconcile_automatic_eligibility,
     regrade_records,
     rejudge_packets,
     write_rejudged_reports,
@@ -89,7 +90,8 @@ def _print_plan(plan: dict[str, object], as_json: bool) -> None:
         print(json.dumps(plan, indent=2, sort_keys=True))
         return
     print(
-        f"{plan['case_count']} cases × {len(plan['arms'])} arms × "
+        f"{plan['case_count']} cases; {plan['condition_count']} eligible case/arm "
+        f"conditions × "
         f"{plan['repetitions']} repetitions"
     )
     if plan["estimated_cost_usd"] is None:
@@ -147,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         arms = args.arm or list(ARMS)
         execute = args.command == "run" and args.execute
         plan = experiment_plan(
+            repo_root,
             cases,
             arms=arms,
             repetitions=args.repetitions,
@@ -182,13 +185,15 @@ def main(argv: list[str] | None = None) -> int:
             if not records:
                 print(f"no raw results under {output_dir}", file=sys.stderr)
                 return 1
+            corpus = validate_corpus(repo_root)
+            reconcile_automatic_eligibility(repo_root, corpus.cases, records)
             paths = write_reports(
                 output_dir,
                 records,
                 compute_scorecard(records),
                 seed=args.audit_seed,
             )
-        except (OSError, ValueError) as error:
+        except (CaseValidationError, OSError, ValueError) as error:
             print(error, file=sys.stderr)
             return 1
         print(paths["scorecard"])
@@ -201,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"no raw results under {output_dir}", file=sys.stderr)
                 return 1
             corpus = validate_corpus(repo_root)
+            reconcile_automatic_eligibility(repo_root, corpus.cases, records)
             paths = regrade_records(
                 repo_root,
                 corpus.cases,
@@ -220,29 +226,43 @@ def main(argv: list[str] | None = None) -> int:
             if not records:
                 print(f"no raw results under {output_dir}", file=sys.stderr)
                 return 1
+            corpus = validate_corpus(repo_root)
+            reconcile_automatic_eligibility(repo_root, corpus.cases, records)
             paths = write_rejudged_reports(
                 output_dir,
                 records,
                 audit_seed=args.audit_seed,
             )
-        except (OSError, ValueError) as error:
+        except (CaseValidationError, OSError, ValueError) as error:
             print(error, file=sys.stderr)
             return 1
         print(paths["scorecard"])
         return 0
     if args.command == "judge":
-        result = rejudge_packets(
-            repo_root,
-            args.output_dir.resolve(),
-            JudgeConfig(args.judge_model, args.judge_reasoning),
-            execute=args.execute,
-            codex_executable=args.codex_executable,
-        )
+        output_dir = args.output_dir.resolve()
+        try:
+            records = load_raw_records(output_dir)
+            if not records:
+                print(f"no raw results under {output_dir}", file=sys.stderr)
+                return 1
+            corpus = validate_corpus(repo_root)
+            reconcile_automatic_eligibility(repo_root, corpus.cases, records)
+            result = rejudge_packets(
+                repo_root,
+                output_dir,
+                JudgeConfig(args.judge_model, args.judge_reasoning),
+                execute=args.execute,
+                codex_executable=args.codex_executable,
+                records=records,
+            )
+        except (CaseValidationError, OSError, ValueError) as error:
+            print(error, file=sys.stderr)
+            return 1
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
         else:
             print(
-                f"{result['packet_count']} persisted packets; "
+                f"{result['packet_count']} eligible persisted packets; "
                 f"{result['judge_calls']} planned judge calls"
             )
         return 0

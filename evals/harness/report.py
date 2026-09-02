@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from evals.harness.codex import completed_tool_call_count
-from evals.harness.score import Scorecard
+from evals.harness.score import Scorecard, is_measured_in_arm
 from evals.harness.suites import SUITES
 
 
@@ -98,7 +98,12 @@ def _comparison(
 
 
 def _outcome_rate(records: list[dict[str, Any]], arm: str) -> float | None:
-    selected = [record for record in records if record.get("arm") == arm]
+    selected = [
+        record
+        for record in records
+        if record.get("arm") == arm
+        and is_measured_in_arm(record, arm)
+    ]
     if not selected:
         return None
     return sum(bool(record.get("outcome_pass")) for record in selected) / len(selected)
@@ -113,7 +118,11 @@ def _target_skills(record: dict[str, Any]) -> list[str]:
 
 def _per_arm_record_count(records: list[dict[str, Any]]) -> str:
     counts = {
-        arm: sum(record.get("arm") == arm for record in records)
+        arm: sum(
+            record.get("arm") == arm
+            and is_measured_in_arm(record, arm)
+            for record in records
+        )
         for arm in ("none", "forced", "automatic")
         if any(record.get("arm") == arm for record in records)
     }

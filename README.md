@@ -103,7 +103,7 @@ This is a breaking taxonomy change. Replace the removed entrypoints as follows:
 
 Skills live at `skills/<skill-name>/SKILL.md`, flat (no language nesting). The `name:` in the SKILL.md frontmatter must match the directory name.
 
-Frontmatter is validated against [`skills.schema.json`](skills.schema.json) — `name` and `description` are required, `name` must be kebab-case. The router also uses Claude Code's optional `paths` extension. Clients that do not support this extension must ignore the `paths` field rather than rejecting the skill.
+Frontmatter is validated against [`skills.schema.json`](skills.schema.json) — `name` and `description` are required, `name` must be kebab-case, and `disable-model-invocation: true` makes a skill explicit-only. The router also uses Claude Code's optional `paths` extension. Clients that do not support this extension must ignore the `paths` field rather than rejecting the skill.
 
 ### Releases
 
@@ -131,9 +131,9 @@ agent-facing seam.
 
 The advisory evaluator tests concrete scenarios modelled on real-world coding
 work, with expected outcomes and no-change controls. It compares no-skill,
-forced-skill, and automatic-routing runs. **Baseline** is the no-skill result,
-**automatic** is the headline result, and **restraint** checks that a skill does
-not make an unnecessary change. Scorecards also compare subject-side tokens,
+forced-skill, and automatic-routing runs. **Baseline** and **automatic** use
+the cases eligible for automatic activation; **restraint** checks that a skill
+does not make an unnecessary change. Scorecards also compare subject-side tokens,
 tool calls, completed turns, elapsed time, and total attempted work per
 successful outcome. The
 table reports the latest available result for each skill and correctness metric.
@@ -158,18 +158,20 @@ may perform differently. These are not merge or release gates. See
 | [`kotlin-concurrency-and-flow`](skills/kotlin-concurrency-and-flow/SKILL.md) | 33.3% | 100.0% | 100.0% |
 | [`kotlin-control-flow`](skills/kotlin-control-flow/SKILL.md) | 27.8% | 100.0% | 100.0% |
 | [`grounded-writing`](skills/grounded-writing/SKILL.md) | — | 100.0% | 100.0% |
-| [`implement-with-subagents`](skills/implement-with-subagents/SKILL.md) | — | 100.0% | 100.0% |
-| [`run-github-project`](skills/run-github-project/SKILL.md) | — | 100.0% | 100.0% |
-| [`shepherd`](skills/shepherd/SKILL.md) | — | 100.0% | 100.0% |
+| [`implement-with-subagents`](skills/implement-with-subagents/SKILL.md) | — | — | 100.0% |
+| [`run-github-project`](skills/run-github-project/SKILL.md) | — | — | 100.0% |
+| [`shepherd`](skills/shepherd/SKILL.md) | — | — | 100.0% |
+| [`to-plan`](skills/to-plan/SKILL.md) | — | — | — |
 
 ### Skill efficiency
 
 Values are per-run medians, baseline → automatic, followed by the automatic
 percentage change. These subject-only measurements use the latest complete,
 same-run evidence available for each suite and include failed runs and negative
-controls. Multi-skill scenarios contribute to every targeted skill row. A turn
-is one completed Codex turn; time remains environment-sensitive. The source
-runs, selection rules, and detailed scorecards are in the
+controls. Baseline-to-automatic efficiency comparisons use only cases eligible
+for automatic activation. Multi-skill scenarios contribute to every targeted
+skill row. A turn is one completed Codex turn; time remains environment-sensitive.
+The source runs, selection rules, and detailed scorecards are in the
 [evaluation change record](evals/artifacts/2026-08-27-skill-eval-efficiency.md).
 
 | Skill | Tokens / run | Tool calls / run | Turns / run | Time / run |
@@ -185,9 +187,6 @@ runs, selection rules, and detailed scorecards are in the
 | [`kotlin-concurrency-and-flow`](skills/kotlin-concurrency-and-flow/SKILL.md) | 72.7k → 119.2k (+64%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 46.0s → 64.2s (+40%) |
 | [`kotlin-control-flow`](skills/kotlin-control-flow/SKILL.md) | 71.8k → 109.6k (+53%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 39.1s → 53.7s (+37%) |
 | [`grounded-writing`](skills/grounded-writing/SKILL.md) | 41.3k → 65.4k (+59%) | 2 → 3 (+50%) | 1 → 1 (+0%) | 16.2s → 26.9s (+66%) |
-| [`implement-with-subagents`](skills/implement-with-subagents/SKILL.md) | 40.9k → 50.9k (+24%) | 2 → 2 (+0%) | 1 → 1 (+0%) | 23.7s → 25.9s (+9%) |
-| [`run-github-project`](skills/run-github-project/SKILL.md) | 41.6k → 59.0k (+42%) | 2 → 3 (+50%) | 1 → 1 (+0%) | 25.0s → 24.1s (-3%) |
-| [`shepherd`](skills/shepherd/SKILL.md) | 51.8k → 74.3k (+43%) | 3 → 4 (+33%) | 1 → 1 (+0%) | 21.8s → 30.2s (+38%) |
 
 ## License
 
