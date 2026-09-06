@@ -31,11 +31,11 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
 
         benchmark = [case for case in report.cases if not case.calibration]
         calibration = [case for case in report.cases if case.calibration]
-        self.assertEqual(15, len(benchmark))
+        self.assertEqual(18, len(benchmark))
         self.assertEqual(12, len(calibration))
         self.assertIn("grounded-writing", PUBLIC_SKILLS)
         self.assertNotIn("implement", PUBLIC_SKILLS)
-        self.assertEqual(15, len(filter_cases(report.cases, case_ids=None, skills=None)))
+        self.assertEqual(18, len(filter_cases(report.cases, case_ids=None, skills=None)))
         self.assertFalse(any(case.kind == "routing" for case in report.cases))
         self.assertEqual(
             {
@@ -206,6 +206,9 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
                 "grounded-writing-direct",
                 "grounded-writing-novel",
                 "grounded-writing-negative",
+                "release-kotlin-library-direct",
+                "release-kotlin-library-novel",
+                "release-kotlin-library-negative",
             },
             {case.id for case, _ in conditions},
         )
