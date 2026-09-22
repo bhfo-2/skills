@@ -8,7 +8,7 @@ import sys
 
 
 VERSION_PATTERN = re.compile(
-    r"^[0-9]{4}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])(?:\.(0[1-9]|[1-9][0-9]))?$"
+    r"^[0-9]{4}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])(?:\.(0?[1-9]|[1-9][0-9]))?$"
 )
 PLUGIN_NAME = "chrisbanes-skills"
 OPENCODE_MAIN = ".opencode/plugins/chrisbanes-skills.js"
@@ -30,9 +30,12 @@ AGENT_PLUGINS_FIELDS = {
 def validate_version(version):
     if not VERSION_PATTERN.fullmatch(version):
         raise ValueError(
-            "Version must use CalVer YYYY.M.D or YYYY.M.D.NN without "
+            "Version must use CalVer YYYY.M.D, YYYY.M.D.N, or YYYY.M.D.NN without "
             f"zero-padded month/day: {version}"
         )
+    parts = version.split(".")
+    if len(parts) == 4 and len(parts[3]) == 1:
+        return ".".join((*parts[:3], f"0{parts[3]}"))
     return version
 
 
@@ -48,7 +51,7 @@ def resolve_version(input_version):
 
 
 def update_manifests(root, version):
-    validate_version(version)
+    version = validate_version(version)
     for path in plugin_manifest_paths(root):
         data = read_json(path)
         data["version"] = version
@@ -56,7 +59,7 @@ def update_manifests(root, version):
 
 
 def validate_manifests(root, version):
-    validate_version(version)
+    version = validate_version(version)
 
     portable = read_json(root / "plugin.json")
     claude = read_json(root / ".claude-plugin" / "plugin.json")

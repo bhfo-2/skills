@@ -24,10 +24,20 @@ class ReleaseScriptTest(unittest.TestCase):
         self.assertEqual(self.release.validate_version("2026.6.17"), "2026.6.17")
 
     def test_validate_version_accepts_daily_release_number(self):
-        self.assertEqual(self.release.validate_version("2026.6.17.01"), "2026.6.17.01")
+        expected_versions = {
+            "2026.6.17.1": "2026.6.17.01",
+            "2026.6.17.01": "2026.6.17.01",
+            "2026.6.17.99": "2026.6.17.99",
+        }
+        for version, expected in expected_versions.items():
+            with self.subTest(version=version):
+                self.assertEqual(self.release.validate_version(version), expected)
 
-    def test_validate_version_requires_two_digit_daily_release_number(self):
-        for version in ("2026.6.17.00", "2026.6.17.1", "2026.6.17.001"):
+    def test_resolve_version_canonicalizes_daily_release_number(self):
+        self.assertEqual(self.release.resolve_version("2026.6.17.1"), "2026.6.17.01")
+
+    def test_validate_version_rejects_out_of_range_daily_release_number(self):
+        for version in ("2026.6.17.0", "2026.6.17.00", "2026.6.17.001", "2026.6.17.100"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 self.release.validate_version(version)
 
@@ -79,8 +89,8 @@ class ReleaseScriptTest(unittest.TestCase):
                 {"name": "chrisbanes-skills"},
             )
 
-            self.release.update_manifests(root, "2026.6.17.01")
-            self.release.validate_manifests(root, "2026.6.17.01")
+            self.release.update_manifests(root, "2026.6.17.1")
+            self.release.validate_manifests(root, "2026.6.17.1")
 
             portable = self.read_json(root / "plugin.json")
             claude = self.read_json(root / ".claude-plugin" / "plugin.json")
