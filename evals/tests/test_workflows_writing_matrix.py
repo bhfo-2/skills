@@ -174,7 +174,7 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
         benchmark = [case for case in report.cases if not case.calibration]
         calibration = [case for case in report.cases if case.calibration]
         self.assertEqual(21, len(benchmark))
-        self.assertEqual(14, len(calibration))
+        self.assertEqual(16, len(calibration))
         self.assertIn("grounded-writing", PUBLIC_SKILLS)
         self.assertNotIn("implement", PUBLIC_SKILLS)
         self.assertEqual(21, len(filter_cases(report.cases, case_ids=None, skills=None)))
@@ -184,6 +184,8 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
                 "implement-with-subagents-missing-provider-challenge",
                 "run-github-project-missing-provider-challenge",
                 "to-plan-authorized-draft-direct",
+                "to-plan-material-assumption-proof-calibration",
+                "to-plan-material-assumption-proof-novel",
                 "to-plan-prior-confirmed-novel",
                 "to-plan-unresolved-choice-negative",
                 "to-plan-discussion-only-negative",
@@ -510,6 +512,88 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
         )
 
         self.assertEqual([], failures)
+
+    def test_material_assumption_proof_case_requires_dependent_implementation(self):
+        report = validate_corpus(REPO_ROOT, suite="workflows-writing")
+        case = next(
+            case
+            for case in report.cases
+            if case.id == "to-plan-material-assumption-proof-calibration"
+        )
+        self.assertEqual("workflow-report-publication", case.fixture)
+        self.assertTrue(case.calibration)
+        self.assertIn("early-proof", case.prompt)
+        self.assertIn("T3 must depend directly on T1, as well as T2", case.prompt)
+        fixture = REPO_ROOT / "evals/fixtures/workflow-report-publication"
+        publisher = (fixture / "report_publisher.py").read_text(encoding="utf-8")
+        config = json.loads((fixture / "report_config.json").read_text(encoding="utf-8"))
+        self.assertIn("def publish_report", publisher)
+        self.assertIn("published.write_bytes(contents)", publisher)
+        self.assertNotIn("os.replace", publisher)
+        self.assertLess(
+            publisher.index("published.write_bytes(contents)"),
+            publisher.index("mark_published("),
+        )
+        self.assertEqual(
+            {
+                "staging_mount": "/runtime/reports/staging",
+                "published_mount": "/runtime/reports/published",
+            },
+            config,
+        )
+        expectations = json.loads(
+            (case.directory / "expectations.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [["T2", "T1"], ["T3", "T1"], ["T3", "T2"]],
+            expectations["task_graph"]["required_edges"],
+        )
+        self.assertTrue(expectations["task_graph"]["require_acyclic"])
+
+    def test_novel_material_assumption_proof_case_is_not_scripted(self):
+        report = validate_corpus(REPO_ROOT, suite="workflows-writing")
+        case = next(
+            case
+            for case in report.cases
+            if case.id == "to-plan-material-assumption-proof-novel"
+        )
+        self.assertEqual("novel", case.kind)
+        self.assertTrue(case.calibration)
+        self.assertEqual("workflow-report-publication", case.fixture)
+        self.assertIn("configured staging mount", case.prompt)
+        self.assertIn("configured published mount", case.prompt)
+        self.assertNotIn("proof", case.prompt.lower())
+        self.assertNotIn("os.replace", case.prompt)
+        self.assertNotIn("T3", case.prompt)
+        rubric_ids = {item["id"] for item in case.rubric}
+        self.assertTrue(
+            {
+                "repository-evidence",
+                "bounded-proof",
+                "failure-gate",
+                "task-dependency",
+                "proposed-publication",
+            }
+            <= rubric_ids
+        )
+        expectations = json.loads(
+            (case.directory / "expectations.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [["T2", "T1"]],
+            expectations["task_graph"]["required_edges"],
+        )
+        self.assertTrue(expectations["task_graph"]["require_acyclic"])
+
+    def test_evidence_backed_plan_counterexample_rejects_speculative_proof(self):
+        report = validate_corpus(REPO_ROOT, suite="workflows-writing")
+        case = next(
+            case for case in report.cases if case.id == "to-plan-authorized-draft-direct"
+        )
+        self.assertTrue(case.calibration)
+        rubric = {item["id"]: item["text"] for item in case.rubric}
+        self.assertIn("one implementation slice", rubric["proportionality"])
+        self.assertIn("without a speculative proof task", rubric["proportionality"])
 
     def test_task_graph_validator_ignores_fenced_markdown_headings_and_fields(self):
         subject = (
