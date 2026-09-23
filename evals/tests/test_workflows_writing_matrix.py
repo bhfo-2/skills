@@ -20,19 +20,132 @@ from evals.harness.experiment import (
 )
 from evals.harness.judge import JudgeConfig
 from evals.harness.suites import PUBLIC_SKILLS, WORKFLOWS_WRITING_SKILLS
+from evals.validators.text_case import validate_task_graph
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def plan_artifact(dependency: str = "none") -> str:
+    return (
+        "<!-- to-plan:conversation-plan:v1 id=123e4567-e89b-42d3-a456-426614174000 -->\n"
+        "# Quote missing validator files\n\n"
+        "**Planned against:** `main` at `0123456789abcdef0123456789abcdef01234567`\n\n"
+        "## Implementation context\n\n"
+        "Existing: `validator.py` defines `missing_file_error`.\n\n"
+        "## Implementation slices\n\n"
+        "**Task graph and parallelism:** The graph is acyclic; one slice has no parallel work.\n\n"
+        "### 1. Quote missing-file paths\n\n"
+        "**Task ID:** `T1`\n"
+        f"**Depends on:** `{dependency}`\n\n"
+        "**Files and symbols:** Edit existing `missing_file_error` in `validator.py` and its test in `tests/test_validator.py`.\n\n"
+        "**Test:** Change the assertion for `settings file.json` to expect exactly `missing file: 'settings file.json'`; expect it to fail before the implementation edit.\n\n"
+        "**Implementation:** Quote the supplied path in `missing_file_error` without changing its signature.\n\n"
+        "**Validate:** From repository root, run `python3 -B -m unittest tests.test_validator`; expect it to pass.\n\n"
+        "**Complete when:** The path, including spaces, is preserved inside quotes and the focused test passes.\n\n"
+        "## Acceptance coverage\n\n"
+        "| Quoted diagnostic | 1 | Focused test |\n\n"
+        "## Final validation\n\n"
+        "- From repository root, run `python3 -B -m unittest tests.test_validator`; expect success.\n"
+    )
+
+
 class WorkflowsWritingMatrixTest(unittest.TestCase):
+    def test_integration_failure_guidance_restores_only_verified_controller_branch(self):
+        guidance = (REPO_ROOT / "skills/implement-with-subagents/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        integration_step = " ".join(
+            guidance.split("9. Integrate", maxsplit=1)[1]
+            .split("10. After every repair", maxsplit=1)[0]
+            .split()
+        )
+
+        conflict_path = integration_step.split(
+            "If the Git operation conflicts before", maxsplit=1
+        )[1].split("If the integration operation completes", maxsplit=1)[0]
+        completed_path = integration_step.split(
+            "If the integration operation completes", maxsplit=1
+        )[1]
+
+        post_integration_capture = (
+            "record the integration branch and its exact `HEAD` SHA as that "
+            "attempt's post-integration SHA"
+        )
+        self.assertIn(post_integration_capture, integration_step)
+        self.assertLess(
+            integration_step.index(post_integration_capture),
+            integration_step.index("Recheck every affected validation"),
+        )
+
+        self.assertIn("git merge --abort", conflict_path)
+        self.assertIn("git cherry-pick --abort", conflict_path)
+        self.assertIn("recorded pre-attempt SHA", conflict_path)
+        self.assertIn("worktree is clean", conflict_path)
+        self.assertIn(
+            "same owner the exact pre-attempt SHA and conflict evidence",
+            conflict_path,
+        )
+        self.assertIn(
+            "git worktree add -b <repair-branch> <repair-path> <recorded-pre-attempt-sha>",
+            conflict_path,
+        )
+        self.assertIn("replay their task-scoped commit(s) there in order", conflict_path)
+        self.assertIn("git cherry-pick <task-commit-sha>", conflict_path)
+        self.assertIn("resolves any replay conflict in that isolated worktree", conflict_path)
+        self.assertIn("Do not retry the stale task branch unchanged", conflict_path)
+
+        self.assertIn("do not use an abort command", completed_path)
+        self.assertIn("pre-attempt state was clean", completed_path)
+        self.assertIn("current branch is still that integration branch", completed_path)
+        self.assertIn("HEAD` is still the exact post-integration SHA", completed_path)
+        self.assertIn("worktree is currently clean", completed_path)
+        self.assertIn("Preserve the failed integrated tree first", completed_path)
+        self.assertIn("fresh controller-owned recovery branch", completed_path)
+        self.assertIn("does not already exist", completed_path)
+        self.assertIn("create it without force", completed_path)
+        self.assertIn(
+            "git branch <recovery-branch> <recorded-post-integration-sha>",
+            completed_path,
+        )
+        self.assertIn("recovery branch still resolves to the exact post-integration SHA", completed_path)
+        self.assertLess(
+            completed_path.index("`git rev-parse <recovery-branch>` resolves to the exact post-integration SHA"),
+            completed_path.index("git reset --hard <recorded-pre-attempt-sha>"),
+        )
+        self.assertIn("create a new task-owned repair branch and isolated worktree from that recovery ref", completed_path)
+        self.assertIn(
+            "git worktree add -b <repair-branch> <repair-path> <recovery-branch>",
+            completed_path,
+        )
+        self.assertIn(
+            "inspect the complete repaired branch range from the recorded pre-attempt SHA",
+            completed_path,
+        )
+        self.assertIn(
+            "integrate the entire repaired task branch in dependency order",
+            completed_path,
+        )
+        self.assertIn(
+            "including both the original task change from the failed integration "
+            "and its repair commits",
+            completed_path,
+        )
+        self.assertIn("Do not cherry-pick only the repair commit", completed_path)
+        self.assertIn("Rerun affected evidence on the reintegrated tree", completed_path)
+        self.assertIn("git reset --hard <recorded-pre-attempt-sha>", completed_path)
+        self.assertIn("do not reset task-owned branches or other refs/worktrees", completed_path)
+        self.assertIn("do not remove untracked files or unrelated changes", completed_path)
+        self.assertIn("exact recorded pre-attempt SHA and clean", completed_path)
+        self.assertIn("stop and report the integration checkout as blocked", completed_path)
+
     def test_has_skill_triads_and_workflow_calibration_coverage_without_routing(self):
         report = validate_corpus(REPO_ROOT, suite="workflows-writing")
 
         benchmark = [case for case in report.cases if not case.calibration]
         calibration = [case for case in report.cases if case.calibration]
         self.assertEqual(21, len(benchmark))
-        self.assertEqual(12, len(calibration))
+        self.assertEqual(14, len(calibration))
         self.assertIn("grounded-writing", PUBLIC_SKILLS)
         self.assertNotIn("implement", PUBLIC_SKILLS)
         self.assertEqual(21, len(filter_cases(report.cases, case_ids=None, skills=None)))
@@ -51,6 +164,8 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
                 "implement-with-subagents-post-edit-negative",
                 "implement-with-subagents-failed-verification-negative",
                 "implement-with-subagents-explicit-rerun-novel",
+                "implement-with-subagents-runtime-capability-calibration",
+                "implement-with-subagents-accepted-item-noop-calibration",
             },
             {case.id for case in calibration},
         )
@@ -73,7 +188,9 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
         )
 
         subagent_cases = [
-            case for case in benchmark if case.fixture == "workflow-subagents"
+            case
+            for case in benchmark
+            if case.fixture == "workflow-subagents" and not case.calibration
         ]
         self.assertEqual(3, len(subagent_cases))
         self.assertTrue(
@@ -335,24 +452,7 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
             workspace = Path(temp_dir)
             draft = workspace / ".scratch/to-plan/repair-validator-output.md"
             draft.parent.mkdir(parents=True)
-            draft.write_text(
-                "<!-- to-plan:conversation-plan:v1 id=123e4567-e89b-42d3-a456-426614174000 -->\n"
-                "# Quote missing validator files\n\n"
-                "**Planned against:** `main` at `0123456789abcdef0123456789abcdef01234567`\n\n"
-                "## Implementation context\n\n"
-                "Existing: `validator.py` defines `missing_file_error`.\n\n"
-                "## Implementation slices\n\n"
-                "### 1. Quote missing validator files\n\n"
-                "**Files and symbols:** Edit existing `missing_file_error` in `validator.py` "
-                "and its test in `tests/test_validator.py`.\n\n"
-                "**Test:** Pass `settings file.json` and assert the exact result "
-                "is `missing file: 'settings file.json'`.\n\n"
-                "**Validate:** `python3 -B -m unittest tests.test_validator`\n\n"
-                "## Final validation\n\n"
-                "- `python3 -B -m unittest tests.test_validator`\n\n"
-                "Update `validator.py` and `tests/test_validator.py`.\n",
-                encoding="utf-8",
-            )
+            draft.write_text(plan_artifact(), encoding="utf-8")
 
             completed = subprocess.run(
                 ["python3", str(validator), "to-plan-authorized-draft-direct"],
@@ -363,6 +463,141 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
             )
 
         self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_task_graph_validator_accepts_required_dependency_edge(self):
+        subject = (
+            "## Implementation slices\n\n"
+            "### 1. Prepare a compatible model\n"
+            "**Task ID:** `T1`\n"
+            "**Depends on:** `none`\n\n"
+            "### 2. Wire the model into the endpoint\n"
+            "**Task ID:** `T2`\n"
+            "**Depends on:** `T1`\n"
+        )
+
+        failures = validate_task_graph(
+            subject,
+            {"required_edges": [["T2", "T1"]], "require_acyclic": True},
+        )
+
+        self.assertEqual([], failures)
+
+    def test_task_graph_validator_ignores_fenced_markdown_headings_and_fields(self):
+        subject = (
+            "```markdown\n"
+            "## Implementation slices\n"
+            "### 1. Example only\n"
+            "**Task ID:** `FAKE`\n"
+            "**Depends on:** `MISSING`\n"
+            "```\n"
+            "## Implementation slices\n\n"
+            "### 1. Actual task\n"
+            "**Task ID:** `T1`\n"
+            "**Depends on:** `none`\n\n"
+            "```md\n"
+            "### 2. Fenced example, not a slice\n"
+            "**Task ID:** `FAKE2`\n"
+            "**Depends on:** `T1`\n"
+            "```\n"
+            "## Acceptance coverage\n"
+        )
+
+        failures = validate_task_graph(
+            subject, {"required_edges": [], "require_acyclic": True}
+        )
+
+        self.assertEqual([], failures)
+
+    def test_task_graph_validator_rejects_unnumbered_slice_before_valid_slice(self):
+        subject = (
+            "## Implementation slices\n\n"
+            "### Unnumbered but declared slice\n"
+            "**Task ID:** `T0`\n"
+            "**Depends on:** `none`\n\n"
+            "### 1. Numbered slice\n"
+            "**Task ID:** `T1`\n"
+            "**Depends on:** `none`\n"
+        )
+
+        failures = validate_task_graph(
+            subject, {"required_edges": [], "require_acyclic": True}
+        )
+
+        self.assertTrue(
+            any("malformed implementation slice heading" in failure for failure in failures),
+            failures,
+        )
+
+    def test_task_graph_validator_rejects_slice_at_unexpected_heading_level(self):
+        subject = (
+            "## Implementation slices\n\n"
+            "### 1. Numbered slice\n"
+            "**Task ID:** `T1`\n"
+            "**Depends on:** `none`\n\n"
+            "#### 2. Hidden deeper slice\n"
+            "**Task ID:** `T2`\n"
+            "**Depends on:** `T1`\n"
+        )
+
+        failures = validate_task_graph(
+            subject, {"required_edges": [], "require_acyclic": True}
+        )
+
+        self.assertTrue(
+            any("unexpected heading level" in failure for failure in failures), failures
+        )
+
+    def test_task_graph_validator_rejects_slice_that_ends_its_section(self):
+        subject = (
+            "## Implementation slices\n\n"
+            "### 1. Numbered slice\n"
+            "**Task ID:** `T1`\n"
+            "**Depends on:** `none`\n\n"
+            "## Unnumbered slice\n"
+            "**Task ID:** `T2`\n"
+            "**Depends on:** `T1`\n"
+        )
+
+        failures = validate_task_graph(
+            subject, {"required_edges": [], "require_acyclic": True}
+        )
+
+        self.assertTrue(
+            any("unexpected section boundary" in failure for failure in failures), failures
+        )
+
+    def test_task_graph_validator_reserves_none_as_dependency_sentinel(self):
+        subject = (
+            "## Implementation slices\n\n"
+            "### 1. A task named none\n"
+            "**Task ID:** `NONE`\n"
+            "**Depends on:** `none`\n"
+        )
+
+        failures = validate_task_graph(
+            subject, {"required_edges": [], "require_acyclic": True}
+        )
+
+        self.assertTrue(any("task ID 'none' is reserved" in failure for failure in failures))
+
+    def test_plan_artifact_validator_rejects_cyclic_task_dependencies(self):
+        validator = REPO_ROOT / "evals/validators/text_case.py"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            draft = workspace / ".scratch/to-plan/cyclic-plan.md"
+            draft.parent.mkdir(parents=True)
+            draft.write_text(plan_artifact(dependency="T1"), encoding="utf-8")
+
+            completed = subprocess.run(
+                ["python3", str(validator), "to-plan-authorized-draft-direct"],
+                cwd=workspace,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(1, completed.returncode)
+        self.assertIn("task dependency graph contains a cycle", completed.stderr)
 
     def test_plan_artifact_validator_rejects_multiple_local_drafts(self):
         validator = REPO_ROOT / "evals/validators/text_case.py"

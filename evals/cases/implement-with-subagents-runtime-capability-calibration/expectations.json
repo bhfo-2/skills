@@ -3,7 +3,7 @@
     "state.md"
   ],
   "must_contain": [
-    "Immutable evaluation state",
+    "Network access is disabled",
     "controller owns"
   ]
 }
