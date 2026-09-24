@@ -100,6 +100,7 @@ def validate_task_graph(
         return [f"{label}: task graph has no implementation slices"]
 
     tasks: dict[str, set[str]] = {}
+    task_bodies: dict[str, str] = {}
     expected_number = 1
     for heading_index, heading in enumerate(slice_headings):
         title = heading.group(2).strip()
@@ -159,6 +160,7 @@ def validate_task_graph(
         if len(set(dependency_ids)) != len(dependency_ids):
             failures.append(f"{label}: task {task_id!r} repeats a dependency")
         tasks[task_id] = set(dependency_ids)
+        task_bodies[task_id] = body
 
     for task_id, dependencies in tasks.items():
         for dependency in dependencies:
@@ -189,6 +191,197 @@ def validate_task_graph(
             failures.append(
                 f"{label}: missing required dependency edge {task_id!r} -> {dependency!r}"
             )
+
+    separate_slice_requirements = rules.get("separate_slice_requirements", [])
+    if not isinstance(separate_slice_requirements, list):
+        return failures + [
+            f"{label}: separate_slice_requirements must be a list"
+        ]
+    matched_tasks: dict[str, str] = {}
+
+    def lists_path(files_field: str, path: str) -> bool:
+        pattern = (
+            rf"(?<![A-Za-z0-9_./-])(?:\./)?{re.escape(path)}"
+            rf"(?![A-Za-z0-9_./-])"
+        )
+        return re.search(pattern, files_field) is not None
+
+    def field(body: str, name: str) -> str:
+        match = re.search(
+            rf"^\*\*{re.escape(name)}:\*\*[ \t]*([\s\S]*?)"
+            r"(?=^\*\*[^\n]+:\*\*|\Z)",
+            body,
+            re.MULTILINE,
+        )
+        return match.group(1) if match else ""
+
+    edit_verbs = r"edit|create|add|update|change|modify|replace|write|implement"
+    inspection_verbs = (
+        r"inspect|read|verify|check|review|leave|leaving|keep|keeping|"
+        r"preserve|preserving|retain|retaining"
+    )
+
+    def is_negated(text: str, action_start: int) -> bool:
+        return re.search(
+            r"\b(?:no|not|never|without|don't|do not)\s+$",
+            text[max(0, action_start - 20) : action_start],
+            re.IGNORECASE,
+        ) is not None
+
+    def has_edit_action(text: str) -> bool:
+        return any(
+            not is_negated(text, action.start())
+            for action in re.finditer(rf"\b(?:{edit_verbs})\b", text, re.IGNORECASE)
+        )
+
+    def path_action(clause: str, path: str) -> str | None:
+        saw_inspection = False
+        for match in re.finditer(
+            rf"(?<![A-Za-z0-9_./-])(?:\./)?{re.escape(path)}(?![A-Za-z0-9_./-])",
+            clause,
+        ):
+            actions = list(
+                re.finditer(
+                    rf"\b(?:{edit_verbs}|{inspection_verbs})\b",
+                    clause[: match.start()],
+                    re.IGNORECASE,
+                )
+            )
+            if not actions:
+                continue
+            last_action = actions[-1]
+            if last_action.group().lower() in edit_verbs.split("|") and not is_negated(
+                clause, last_action.start()
+            ):
+                return "edit"
+            saw_inspection = True
+        return "inspect" if saw_inspection else None
+
+    def edits_path(text: str, path: str) -> bool:
+        return any(
+            path_action(clause, path) == "edit"
+            for clause in re.split(r";|(?<=\.)\s+(?=[A-Z])", text)
+        )
+
+    def owns_path(body: str, path: str) -> bool:
+        files_field = field(body, "Files and symbols")
+        for clause in re.split(r";|(?<=\.)\s+(?=[A-Z])", files_field):
+            if not lists_path(clause, path):
+                continue
+            action = path_action(clause, path)
+            if action == "edit":
+                return True
+            if action == "inspect":
+                continue
+            if re.search(
+                r"\b(?:inspect only|no edits?|read.only|do not edit|do not change)\b",
+                clause,
+                re.IGNORECASE,
+            ):
+                continue
+            if re.match(
+                rf"^\s*(?:[-*]\s*)?(?:{inspection_verbs})\b",
+                clause,
+                re.IGNORECASE,
+            ):
+                continue
+            if has_edit_action(field(body, "Test")) and has_edit_action(
+                field(body, "Implementation")
+            ):
+                return True
+        return False
+
+    for requirement in separate_slice_requirements:
+        if not isinstance(requirement, dict):
+            failures.append(
+                f"{label}: separate slice requirements must be objects"
+            )
+            continue
+        requirement_id = requirement.get("id")
+        owned_files = requirement.get("owned_files")
+        owned_symbols = requirement.get("owned_symbols", [])
+        if (
+            not isinstance(requirement_id, str)
+            or not requirement_id.strip()
+            or not isinstance(owned_files, list)
+            or not owned_files
+            or any(not isinstance(path, str) or not path for path in owned_files)
+            or not isinstance(owned_symbols, list)
+            or any(not isinstance(symbol, str) or not symbol for symbol in owned_symbols)
+        ):
+            failures.append(
+                f"{label}: separate slice requirements need an id, non-empty owned_files, and valid owned_symbols"
+            )
+            continue
+        matches = [
+            task_id
+            for task_id, body in task_bodies.items()
+            if all(owns_path(body, path) for path in owned_files)
+        ]
+        if len(matches) != 1:
+            failures.append(
+                f"{label}: independent behavior {requirement_id!r} must be contained in exactly one slice; found {len(matches)}"
+            )
+            continue
+        task_id = matches[0]
+        previous = matched_tasks.get(task_id)
+        if previous is not None:
+            failures.append(
+                f"{label}: independent behaviors {previous!r} and {requirement_id!r} share slice {task_id!r}"
+            )
+        else:
+            matched_tasks[task_id] = requirement_id
+
+    for task_id, body in task_bodies.items():
+        planned_edits = (
+            field(body, "Files and symbols"),
+            field(body, "Implementation"),
+        )
+        for requirement in separate_slice_requirements:
+            if not isinstance(requirement, dict):
+                continue
+            owned_files = requirement.get("owned_files")
+            owned_symbols = requirement.get("owned_symbols", [])
+            if not isinstance(owned_files, list) or any(
+                not isinstance(path, str) for path in owned_files
+            ):
+                continue
+            if not isinstance(owned_symbols, list) or any(
+                not isinstance(symbol, str) for symbol in owned_symbols
+            ):
+                continue
+            if matched_tasks.get(task_id) != requirement.get("id") and any(
+                edits_path(section, target)
+                for section in planned_edits
+                for target in [*owned_files, *owned_symbols]
+            ):
+                failures.append(
+                    f"{label}: slice {task_id!r} edits independent behavior "
+                    f"{requirement['id']!r} outside its owning slice"
+                )
+
+    def depends_transitively(task_id: str, target: str) -> bool:
+        pending = list(tasks.get(task_id, set()))
+        visited: set[str] = set()
+        while pending:
+            dependency = pending.pop()
+            if dependency == target:
+                return True
+            if dependency not in visited:
+                visited.add(dependency)
+                pending.extend(tasks.get(dependency, set()))
+        return False
+
+    matched = list(matched_tasks.items())
+    for index, (task_id, requirement_id) in enumerate(matched):
+        for other_task_id, other_requirement_id in matched[index + 1 :]:
+            if depends_transitively(task_id, other_task_id) or depends_transitively(
+                other_task_id, task_id
+            ):
+                failures.append(
+                    f"{label}: independent behaviors {requirement_id!r} and "
+                    f"{other_requirement_id!r} must not depend on each other"
+                )
 
     if rules.get("require_acyclic", False):
         visiting: set[str] = set()
