@@ -32,6 +32,10 @@
     {
       "id": "criterion-2",
       "text": "The component no longer owns caller-visible search state"
+    },
+    {
+      "id": "preview-scope",
+      "text": "The edit stays within the allowed Kotlin source path. State-driven content callable with sample query and callback values remains previewable without an @Preview wrapper. If the solution adds a wrapper that needs tooling absent from the declared build, it reports the setup gap instead of editing a build file or claiming the wrapper is runnable"
     }
   ],
   "provenance": {

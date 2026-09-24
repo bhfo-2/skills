@@ -527,6 +527,162 @@ class WorkflowsWritingMatrixTest(unittest.TestCase):
         self.assertEqual([], records[0]["expected_skills"])
         self.assertEqual([], records[0]["allowed_skills"])
 
+    def test_shepherd_novel_is_an_analysis_only_case(self):
+        report = validate_corpus(REPO_ROOT, suite="workflows-writing")
+        case = next(case for case in report.cases if case.id == "shepherd-novel")
+
+        self.assertTrue(case.forbid_all_commands)
+        self.assertIn("unnamed macOS check", case.prompt)
+        rubric = " ".join(item["text"] for item in case.rubric)
+        self.assertIn("exact check name", rubric)
+        self.assertIn("single forced-skill entrypoint read", rubric)
+        self.assertIn("full local suite before one repair push", rubric)
+
+    def test_formatting_negative_supplies_the_text_and_preserves_the_noop(self):
+        report = validate_corpus(REPO_ROOT, suite="workflows-writing")
+        case = next(
+            case
+            for case in report.cases
+            if case.id == "android-benchmark-comparison-negative"
+        )
+        draft = (REPO_ROOT / "evals/fixtures/text/draft.md").read_text(encoding="utf-8").rstrip()
+        expectation = json.loads(
+            (case.directory / "expectations.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn(f"```text\n{draft}\n```", case.prompt)
+        self.assertLessEqual(max(map(len, draft.splitlines())), 80)
+        self.assertTrue(case.automatic_no_skill_control)
+        self.assertTrue(case.forbid_all_commands)
+        line_width_pattern = next(
+            pattern for pattern in expectation["must_not_match"] if "81" in pattern
+        )
+        flags = re.MULTILINE | re.DOTALL
+        self.assertGreater(len(draft), 80)
+        self.assertIsNone(re.search(line_width_pattern, draft, flags))
+        self.assertIsNone(re.search(line_width_pattern, "x" * 80, flags))
+        self.assertIsNotNone(re.search(line_width_pattern, "x" * 81, flags))
+
+    def test_benchmark_direct_accepts_spread_for_unavailable_variability(self):
+        expectation = json.loads(
+            (
+                REPO_ROOT
+                / "evals/cases/android-benchmark-comparison-direct/expectations.json"
+            ).read_text(encoding="utf-8")
+        )
+        variability_pattern = next(
+            pattern for pattern in expectation["must_match"] if "spread" in pattern
+        )
+        missing_data_pattern = next(
+            pattern
+            for pattern in expectation["must_match"]
+            if "not (?:provided|supplied|attached|included)" in pattern
+        )
+
+        self.assertIsNotNone(re.search(variability_pattern, "Per-run spread is unavailable."))
+        self.assertIsNotNone(re.search(variability_pattern, "Per-run variability is unavailable."))
+        self.assertIsNotNone(
+            re.search(
+                variability_pattern,
+                "The improved consistency cannot be quantified without raw results.",
+            )
+        )
+        self.assertIsNotNone(
+            re.search(
+                variability_pattern,
+                "The results were more consistent, but this does not establish which control caused it.",
+                re.DOTALL,
+            )
+        )
+        self.assertIsNotNone(
+            re.search(
+                variability_pattern,
+                "The results were more consistent. The evidence does not isolate the effect of affinity.",
+                re.DOTALL,
+            )
+        )
+        self.assertIsNone(re.search(variability_pattern, "Results were more consistent."))
+        self.assertIsNone(re.search(variability_pattern, "Per-run range is unavailable."))
+        self.assertIsNotNone(
+            re.search(missing_data_pattern, "The raw traces were not supplied.")
+        )
+        self.assertIsNotNone(
+            re.search(missing_data_pattern, "The raw results and traces were not included.")
+        )
+        self.assertIsNotNone(
+            re.search(missing_data_pattern, "The note does not include raw results or traces.")
+        )
+
+    def test_benchmark_direct_accepts_explicit_absence_of_raw_results_and_traces(self):
+        expectation = json.loads(
+            (
+                REPO_ROOT
+                / "evals/cases/android-benchmark-comparison-direct/expectations.json"
+            ).read_text(encoding="utf-8")
+        )
+        missing_data_pattern = next(
+            pattern
+            for pattern in expectation["must_match"]
+            if "not (?:provided|supplied|attached|included)" in pattern
+        )
+
+        accepted = (
+            "The report contains no raw results or traces.",
+            "The report contains neither the raw results nor traces.",
+            "Neither raw results nor traces are included in the supplied evidence.",
+            "The note does not provide its location, raw results, or traces.",
+        )
+        saved_report_excerpts = (
+            "The run record is referenced, but the supplied evidence contains no raw\n"
+            "results or traces. It also gives no completed-case or iteration counts, so\n"
+            "coverage cannot be verified.",
+            "The note references a run record, but the supplied material contains neither\n"
+            "the raw results nor traces. It also gives no completed-case or iteration\n"
+            "counts, metric definition, per-run spread, or exact device and run conditions.",
+        )
+        partial_evidence = (
+            "The report contains no raw results, but the traces are available.",
+            "The report includes the raw results and traces.",
+            "Neither raw results nor traces are fabricated here; both are attached.",
+            "The note does not provide raw results, but traces are attached.",
+        )
+
+        for text in (*accepted, *saved_report_excerpts):
+            with self.subTest(text=text):
+                self.assertIsNotNone(re.search(missing_data_pattern, text))
+
+        for text in partial_evidence:
+            with self.subTest(text=text):
+                self.assertIsNone(re.search(missing_data_pattern, text))
+
+    def test_benchmark_count_guards_ignore_citations_and_build_metadata(self):
+        expectation = json.loads(
+            (
+                REPO_ROOT
+                / "evals/cases/android-benchmark-comparison-direct/expectations.json"
+            ).read_text(encoding="utf-8")
+        )
+        patterns = expectation["must_not_match"]
+        unsupported_claims = (
+            "This benchmark comparison completed 12 cases and recorded 8 iterations.",
+            "Benchmark cases: 12; benchmark iterations: 8.",
+        )
+        harmless_context = (
+            "Build 51 on API 35; issue #42; see case 4 in Appendix 3.",
+            "Historical metadata lists 4 cases in source note [8]; schema v2.1; build 4.3.",
+            "Archived run metadata: completed cases=12; iteration count=8.",
+        )
+
+        for text in unsupported_claims:
+            with self.subTest(text=text):
+                self.assertTrue(
+                    any(re.search(pattern, text) for pattern in patterns)
+                )
+
+        for text in harmless_context:
+            with self.subTest(text=text):
+                self.assertFalse(any(re.search(pattern, text) for pattern in patterns))
+
     def test_behavioral_expectations_do_not_assert_fixture_prose(self):
         expectations = json.loads(
             (

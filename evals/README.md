@@ -37,11 +37,11 @@ in forced runs, including their no-change controls. **Restraint** is the
 no-change-control pass rate: the skill may inspect the task, but must not make
 an unnecessary change. The table reports the latest available result for each skill and
 correctness metric. These scores were produced using
-[`gpt-5.6-terra`](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
-with medium reasoning, judged by
-[`gpt-5.6-sol`](https://developers.openai.com/api/docs/models/gpt-5.6-sol) with
+[`gpt-6-luna`](https://developers.openai.com/api/docs/models/gpt-6-luna)
+with high reasoning, judged by
+[`gpt-6-sol`](https://developers.openai.com/api/docs/models/gpt-6-sol) with
 high reasoning. Results are model- and reasoning-specific; other configurations
-may perform differently.
+may perform differently. The human audit queue remains open.
 
 The rows are descriptive diagnostics, not individual release gates. Multi-skill
 scenarios contribute to each relevant skill row, so the rows are not a
@@ -51,21 +51,31 @@ suite-wide aggregate.
 | --- | ---: | ---: | ---: |
 | `compose-animations` | 75.0% | 100.0% | 100.0% |
 | `compose-component-design` | 86.7% | 100.0% | 100.0% |
-| `compose-focus-navigation` | 66.7% | 100.0% | 100.0% |
-| `compose-performance` | 91.7% | 100.0% | 100.0% |
-| `compose-state-and-effects` | 77.8% | 100.0% | 100.0% |
+| `compose-focus-navigation` | 33.3% | 100.0% | 100.0% |
+| `compose-performance` | 83.3% | 100.0% | 100.0% |
+| `compose-state-and-effects` | 83.3% | 100.0% | 100.0% |
 | `compose-ui-testing-patterns` | 55.6% | 100.0% | 100.0% |
-| `gradle-run` | 33.3% | 100.0% | 100.0% |
-| `kotlin-api-design` | 66.7% | 100.0% | 100.0% |
-| `kotlin-concurrency-and-flow` | 33.3% | 100.0% | 100.0% |
-| `kotlin-control-flow` | 27.8% | 100.0% | 100.0% |
-| `android-benchmark-comparison` | — | — | — |
-| `grounded-writing` | — | 100.0% | 100.0% |
+| `gradle-run` | 41.7% | 100.0% | 100.0% |
+| `kotlin-api-design` | 58.3% | 100.0% | 100.0% |
+| `kotlin-concurrency-and-flow` | 44.4% | 100.0% | 100.0% |
+| `kotlin-control-flow` | 33.3% | 100.0% | 100.0% |
+| `android-benchmark-comparison` | 33.3% | 100.0% | 100.0% |
+| `grounded-writing` | 0.0% | 100.0% | 100.0% |
 | `implement-with-subagents` | — | — | 100.0% |
-| `release-kotlin-library` | — | — | — |
+| `release-kotlin-library` | 0.0% | 100.0% | 100.0% |
 | `run-github-project` | — | — | 100.0% |
 | `shepherd` | — | — | 100.0% |
-| `to-plan` | — | — | — |
+| `to-plan` | — | — | 100.0% |
+
+The `android-benchmark-comparison`, `compose-state-and-effects`,
+`compose-ui-testing-patterns`, `gradle-run`, `grounded-writing`, `kotlin-api-design`,
+`kotlin-concurrency-and-flow`, `kotlin-control-flow`, and
+`release-kotlin-library` automatic cells, and the `to-plan` restraint cell,
+use later focused evidence. Baseline and efficiency values use the complete
+suite. The [improvement result record](artifacts/2026-09-24-gpt6-improvement-results.md),
+[targeted probe record](artifacts/2026-09-24-gpt6-targeted-100-probes.md),
+and [inline repair record](artifacts/2026-09-24-gpt6-inline-repair-results.md)
+give provenance and remaining failures.
 
 ### Skill efficiency
 
@@ -75,24 +85,24 @@ same-run evidence available for each suite and include failed runs and negative
 controls. Baseline-to-automatic efficiency comparisons use only cases eligible
 for automatic activation. Multi-skill scenarios contribute to every targeted
 skill row. A turn is one completed Codex turn; time remains environment-sensitive.
-The source runs, selection rules, and detailed scorecards are in the
-[evaluation change record](artifacts/2026-08-27-skill-eval-efficiency.md).
+Run provenance and local scorecard paths are in the
+[GPT-6 improvement result record](artifacts/2026-09-24-gpt6-improvement-results.md).
 
 | Skill | Tokens / run | Tool calls / run | Turns / run | Time / run |
 | --- | ---: | ---: | ---: | ---: |
-| `compose-animations` | 41.7k → 81.9k (+96%) | 2 → 5 (+150%) | 1 → 1 (+0%) | 26.3s → 42.3s (+60%) |
-| `compose-component-design` | 56.3k → 66.9k (+19%) | 3 → 3 (+0%) | 1 → 1 (+0%) | 32.6s → 29.1s (-11%) |
-| `compose-focus-navigation` | 56.2k → 77.1k (+37%) | 3 → 6 (+100%) | 1 → 1 (+0%) | 32.4s → 44.1s (+36%) |
-| `compose-performance` | 56.2k → 83.0k (+48%) | 3 → 4 (+33%) | 1 → 1 (+0%) | 32.5s → 40.1s (+24%) |
-| `compose-state-and-effects` | 56.2k → 83.3k (+48%) | 3 → 5 (+67%) | 1 → 1 (+0%) | 28.5s → 41.6s (+46%) |
-| `compose-ui-testing-patterns` | 56.7k → 69.0k (+22%) | 3 → 4 (+33%) | 1 → 1 (+0%) | 32.9s → 34.1s (+4%) |
-| `gradle-run` | 70.7k → 83.3k (+18%) | 4 → 3 (-25%) | 1 → 1 (+0%) | 30.2s → 32.9s (+9%) |
-| `kotlin-api-design` | 57.4k → 145.8k (+154%) | 3 → 7 (+133%) | 1 → 1 (+0%) | 30.0s → 53.0s (+77%) |
-| `kotlin-concurrency-and-flow` | 72.7k → 119.2k (+64%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 46.0s → 64.2s (+40%) |
-| `kotlin-control-flow` | 71.8k → 109.6k (+53%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 39.1s → 53.7s (+37%) |
-| `android-benchmark-comparison` | — | — | — | — |
-| `grounded-writing` | 41.3k → 65.4k (+59%) | 2 → 3 (+50%) | 1 → 1 (+0%) | 16.2s → 26.9s (+66%) |
-| `release-kotlin-library` | — | — | — | — |
+| `compose-animations` | 58.6k → 85.4k (+46%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 28.2s → 34.8s (+23%) |
+| `compose-component-design` | 48.7k → 73.4k (+51%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 24.4s → 29.5s (+21%) |
+| `compose-focus-navigation` | 59.1k → 84.9k (+44%) | 5 → 5 (+0%) | 1 → 1 (+0%) | 28.9s → 36.6s (+27%) |
+| `compose-performance` | 49.1k → 85.0k (+73%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 26.4s → 31.8s (+21%) |
+| `compose-state-and-effects` | 60.1k → 89.0k (+48%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 28.2s → 37.8s (+34%) |
+| `compose-ui-testing-patterns` | 60.2k → 84.2k (+40%) | 5.5 → 5 (-9%) | 1 → 1 (+0%) | 27.1s → 26.8s (-1%) |
+| `gradle-run` | 59.8k → 104.3k (+75%) | 4 → 7 (+75%) | 1 → 1 (+0%) | 27.6s → 45.3s (+64%) |
+| `kotlin-api-design` | 60.1k → 83.9k (+40%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 32.8s → 38.8s (+18%) |
+| `kotlin-concurrency-and-flow` | 60.0k → 74.0k (+23%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 26.5s → 28.0s (+6%) |
+| `kotlin-control-flow` | 60.9k → 83.9k (+38%) | 5 → 5 (+0%) | 1 → 1 (+0%) | 26.2s → 38.5s (+47%) |
+| `android-benchmark-comparison` | 46.9k → 53.8k (+15%) | 3 → 3 (+0%) | 1 → 1 (+0%) | 23.2s → 35.0s (+51%) |
+| `grounded-writing` | 35.6k → 56.9k (+60%) | 2 → 4 (+100%) | 1 → 1 (+0%) | 23.2s → 22.1s (-5%) |
+| `release-kotlin-library` | 70.2k → 88.3k (+26%) | 4 → 5 (+25%) | 1 → 1 (+0%) | 42.1s → 43.9s (+4%) |
 
 ## Evaluation setup
 
@@ -240,15 +250,14 @@ npm test
 The published results use:
 
 - subject:
-  [`gpt-5.6-terra`](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
-  with `medium` reasoning; and
+  [`gpt-6-luna`](https://developers.openai.com/api/docs/models/gpt-6-luna)
+  with `high` reasoning; and
 - judge:
-  [`gpt-5.6-sol`](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
+  [`gpt-6-sol`](https://developers.openai.com/api/docs/models/gpt-6-sol)
   with `high` reasoning.
 
-The Terra subject avoids the ceiling observed when Sol-medium solved every
-calibration case without skills, while the stronger Sol judge keeps outcome
-assessment stable.
+The Luna/high subject left measurable baseline headroom in all three suites.
+The Sol/high judge remained fixed across every arm.
 
 Keep the pair unchanged across all arms. Use a separate, explicitly named run
 for another model or reasoning effort; never combine fingerprints in one

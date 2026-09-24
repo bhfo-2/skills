@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import subprocess
 from copy import deepcopy
 from dataclasses import asdict
@@ -14,6 +15,7 @@ from evals.harness.codex import (
     ARMS,
     RunConfig,
     SubjectResult,
+    _GRADLE_OUTPUT_DIRECTORIES,
     automatically_invokable_public_skills,
     captured_skill_file_evidence,
     completed_turn_count,
@@ -24,10 +26,11 @@ from evals.harness.codex import (
     run_subject,
     subject_output_valid,
 )
-from evals.harness.grade import ObjectiveGrade, grade_subject
+from evals.harness.grade import ObjectiveGrade, _event_invocations, grade_subject
 from evals.harness.judge import (
     JudgeConfig,
     JudgeResult,
+    build_judge_command,
     build_judge_packet,
     judge_covers_rubric,
     judge_output_valid,
@@ -53,6 +56,19 @@ RUN_CONTROL_FIELDS = (
     "subject_model",
     "judge_model",
 )
+
+COMMAND_OUTPUT_TIMEOUT_SECONDS = 30
+CODEX_VERSION_TIMEOUT_SECONDS = 10
+GRADLE_PREFLIGHT_TIMEOUT_SECONDS = 180
+JUDGE_PROTOCOL_SOURCES = ("cases.py", "codex.py", "experiment.py", "grade.py", "judge.py")
+
+
+def _judge_protocol_digest(harness_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for name in JUDGE_PROTOCOL_SOURCES:
+        digest.update(name.encode())
+        digest.update((harness_dir / name).read_bytes())
+    return digest.hexdigest()
 
 
 def _routing_expectations(
@@ -94,12 +110,61 @@ def evaluation_conditions(
 def _apply_routing_expectations(
     record: dict[str, Any], case: EvalCase, repo_root: Path
 ) -> None:
-    expected_skills, allowed_skills = _routing_expectations(
-        case, str(record.get("arm")), repo_root
+    subject = record.get("subject")
+    events = subject.get("events", []) if isinstance(subject, dict) else []
+    expected_skills, allowed_skills = _result_routing_expectations(
+        case, str(record.get("arm")), repo_root, events
     )
     record["expected_skills"] = list(expected_skills)
     record["allowed_skills"] = list(allowed_skills)
     record["automatic_eligible"] = _automatic_eligible(case, repo_root)
+
+
+def _gradle_was_executed(events: object) -> bool:
+    if not isinstance(events, (list, tuple)):
+        return False
+    normalized_events = tuple(event for event in events if isinstance(event, dict))
+    for invocation in _event_invocations(normalized_events):
+        try:
+            words = shlex.split(invocation)
+        except ValueError:
+            continue
+        if not words:
+            continue
+        executable = Path(words[0]).name
+        gradle_runner_indexes = [
+            index
+            for index, word in enumerate(words)
+            if Path(word).name == "gradle_run.py"
+        ]
+        if any(
+            (
+                index == 0
+                or Path(words[0]).name in {"python", "python3", "python3.13"}
+            )
+            and "run" in words[index + 1 :]
+            for index in gradle_runner_indexes
+        ):
+            return True
+        if executable == "gradle" or executable.startswith("gradlew"):
+            return True
+    return False
+
+
+def _result_routing_expectations(
+    case: EvalCase,
+    arm: str,
+    repo_root: Path,
+    events: object,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    expected_skills, allowed_skills = _routing_expectations(case, arm, repo_root)
+    if arm == "automatic" and "gradle-run" in allowed_skills:
+        if _gradle_was_executed(events):
+            if "gradle-run" not in expected_skills:
+                expected_skills = (*expected_skills, "gradle-run")
+        elif "gradle-run" not in expected_skills:
+            allowed_skills = tuple(skill for skill in allowed_skills if skill != "gradle-run")
+    return expected_skills, allowed_skills
 
 
 def reconcile_automatic_eligibility(
@@ -218,7 +283,9 @@ def _case_digest(case: EvalCase) -> str:
     for label, root in roots:
         for path in sorted(path for path in root.rglob("*") if path.is_file()):
             relative = path.relative_to(root)
-            if label == "fixture" and {".gradle", "build"} & set(relative.parts):
+            if label == "fixture" and set(_GRADLE_OUTPUT_DIRECTORIES) & set(
+                relative.parts
+            ):
                 continue
             digest.update(label.encode())
             digest.update(b"\0")
@@ -255,24 +322,60 @@ def _skill_source_paths(repo_root: Path) -> tuple[Path, ...]:
     )
 
 
-def _command_output(command: list[str], *, cwd: Path) -> str:
-    completed = subprocess.run(
-        command, cwd=cwd, text=True, capture_output=True, check=True
-    )
+def _command_output(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int = COMMAND_OUTPUT_TIMEOUT_SECONDS,
+    timeout_hint: str | None = None,
+) -> str:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        message = (
+            f"Command {shlex.join(command)} timed out after {timeout_seconds}s "
+            f"in {cwd}."
+        )
+        if timeout_hint:
+            message += f" {timeout_hint}"
+        raise RuntimeError(message) from error
     return completed.stdout.strip()
+
+
+def _codex_version(repo_root: Path, codex_executable: str) -> str:
+    return _command_output(
+        [codex_executable, "--version"],
+        cwd=repo_root,
+        timeout_seconds=CODEX_VERSION_TIMEOUT_SECONDS,
+        timeout_hint=(
+            "Check the Codex CLI installation and executable code signature, then retry."
+        ),
+    )
 
 
 def preflight(
     repo_root: Path, codex_executable: str, cases: Iterable[EvalCase]
 ) -> tuple[str, str]:
-    codex_version = _command_output([codex_executable, "--version"], cwd=repo_root)
+    codex_version = _codex_version(repo_root, codex_executable)
     skill_sha = _command_output(["git", "rev-parse", "HEAD"], cwd=repo_root)
     for fixture_name in sorted({case.fixture for case in cases}):
         fixture = repo_root / "evals" / "fixtures" / fixture_name
         wrapper = fixture / "gradlew"
         if wrapper.is_file():
             _command_output(
-                [str(wrapper), "--offline", "--no-scan", "test"], cwd=fixture
+                [str(wrapper), "--offline", "--no-scan", "test"],
+                cwd=fixture,
+                timeout_seconds=GRADLE_PREFLIGHT_TIMEOUT_SECONDS,
+                timeout_hint=(
+                    "Check the offline Gradle dependencies and inspect the fixture build output."
+                ),
             )
     return codex_version, skill_sha
 
@@ -342,7 +445,9 @@ def _result_payload(
     repo_root: Path,
 ) -> dict[str, Any]:
     reported = reported_skill_names(subject.final_output)
-    expected_skills, allowed_skills = _routing_expectations(case, arm, repo_root)
+    expected_skills, allowed_skills = _result_routing_expectations(
+        case, arm, repo_root, subject.events
+    )
     automatic_eligible = _automatic_eligible(case, repo_root)
     judge_pass = judge.returncode == 0 and judge_passes_rubric(
         judge.output, case.rubric
@@ -433,6 +538,7 @@ def execute_experiment(
     skill_catalog_digest = _skill_catalog_digest(
         tuple(sorted({*skill_paths, *skill_sources}, key=str))
     )
+    judge_protocol_digest = _judge_protocol_digest(Path(__file__).parent)
     records: list[dict[str, Any]] = []
     for case, arm in conditions:
         for repetition in range(1, repetitions + 1):
@@ -445,6 +551,7 @@ def execute_experiment(
                 reasoning=run_config.reasoning,
                 judge_model=judge_config.model,
                 judge_reasoning=judge_config.reasoning,
+                judge_protocol_digest=judge_protocol_digest,
                 skill_catalog_digest=skill_catalog_digest,
             )
             result_path = output_dir / "raw" / case.id / arm / f"{repetition}.json"
@@ -667,8 +774,12 @@ def write_rejudged_reports(
     records: list[dict[str, Any]],
     *,
     audit_seed: int,
+    repo_root: Path,
 ) -> dict[str, Path]:
+    skill_paths = discover_skill_paths(repo_root)
+    skill_catalog_digest = _skill_catalog_digest(skill_paths)
     packets: dict[tuple[str, int], tuple[str, dict[str, Any]]] = {}
+    packet_paths: dict[str, Path] = {}
     for packet_path in sorted((output_dir / "judge-packets").glob("*.json")):
         try:
             candidate_id, fingerprint_prefix, repetition = packet_path.stem.rsplit(
@@ -683,6 +794,7 @@ def write_rejudged_reports(
         if key in packets:
             raise ValueError(f"duplicate judge packet for fingerprint: {packet_path}")
         packets[key] = (packet_path.stem, packet)
+        packet_paths[packet_path.stem] = packet_path
 
     judgments: dict[str, tuple[str, dict[str, Any]]] = {}
     for result_path in sorted((output_dir / "rejudgments").glob("*/*.json")):
@@ -697,6 +809,34 @@ def write_rejudged_reports(
         ):
             raise ValueError(f"invalid rejudgment payload: {result_path}")
         packet_name = result_path.parent.name
+        packet_path = packet_paths.get(packet_name)
+        if packet_path is None:
+            continue
+        judge_model = payload.get("judge_model")
+        codex_version = payload.get("codex_version")
+        if not isinstance(judge_model, dict) or not isinstance(codex_version, str):
+            raise ValueError(f"rejudgment lacks run controls: {result_path}")
+        model = judge_model.get("model")
+        reasoning = judge_model.get("reasoning")
+        if not isinstance(model, str) or not isinstance(reasoning, str):
+            raise ValueError(f"invalid rejudgment model: {result_path}")
+        prompt_digest = hashlib.sha256(
+            build_judge_command(
+                packet_path,
+                repo_root,
+                JudgeConfig(model, reasoning),
+                skill_paths=skill_paths,
+            )[-1].encode()
+        ).hexdigest()
+        current_fingerprint = _rejudgment_fingerprint(
+            packet_path,
+            JudgeConfig(model, reasoning),
+            skill_catalog_digest=skill_catalog_digest,
+            codex_version=codex_version,
+            judge_prompt_digest=prompt_digest,
+        )
+        if fingerprint != current_fingerprint:
+            continue
         if packet_name in judgments:
             raise ValueError(f"ambiguous rejudgments for packet: {packet_name}")
         judgments[packet_name] = (fingerprint, payload)
@@ -718,7 +858,7 @@ def write_rejudged_reports(
         candidate_id = packet["candidate_id"]
         rejudgment = judgments.get(packet_name)
         if rejudgment is None:
-            raise ValueError(f"missing rejudgment for packet: {packet_name}")
+            raise ValueError(f"missing current rejudgment for packet: {packet_name}")
         rejudgment_fingerprint, judgment = rejudgment
         if judgment["candidate_id"] != candidate_id:
             raise ValueError(f"rejudgment candidate mismatch: {packet_name}")
@@ -788,7 +928,7 @@ def rejudge_packets(
     }
     if not execute:
         return plan
-    codex_version = _command_output([codex_executable, "--version"], cwd=repo_root)
+    codex_version = _codex_version(repo_root, codex_executable)
     skill_paths = discover_skill_paths(repo_root)
     skill_catalog_digest = _skill_catalog_digest(skill_paths)
     completed = 0
@@ -800,6 +940,15 @@ def rejudge_packets(
             judge_config,
             skill_catalog_digest=skill_catalog_digest,
             codex_version=codex_version,
+            judge_prompt_digest=hashlib.sha256(
+                build_judge_command(
+                    packet_path,
+                    repo_root,
+                    judge_config,
+                    codex_executable=codex_executable,
+                    skill_paths=skill_paths,
+                )[-1].encode()
+            ).hexdigest(),
         )
         result_path = _rejudgment_result_path(output_dir, packet_path, fingerprint)
         if result_path.is_file():
@@ -858,12 +1007,14 @@ def _rejudgment_fingerprint(
     *,
     skill_catalog_digest: str,
     codex_version: str,
+    judge_prompt_digest: str,
 ) -> str:
     identity = {
         "packet_digest": hashlib.sha256(packet_path.read_bytes()).hexdigest(),
         "judge_config": asdict(judge_config),
         "skill_catalog_digest": skill_catalog_digest,
         "codex_version": codex_version,
+        "judge_prompt_digest": judge_prompt_digest,
     }
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

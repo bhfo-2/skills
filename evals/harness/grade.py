@@ -85,6 +85,15 @@ _SHELL_CONTROL_WORDS = _SHELL_CONTROL_PREFIXES | {
 _PYTHON_EXECUTABLE = re.compile(r"python(?:3(?:\.\d+)?)?$")
 _ENVIRONMENT_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.DOTALL)
 _WORKFLOW_OUTPUT = re.compile(r'"workflow"\s*:\s*"([a-z0-9]{32})"')
+_WORKFLOW_ID = re.compile(r"^[a-z0-9]{32}$")
+_POSSIBLE_LOG_READ = re.compile(
+    r"(?:\b(?:cat|head|tail|less|more|sed|awk|grep|rg|strings|open|read_text|read_bytes|Get-Content)\b[^\n]*\.log\b|"
+    r"\.log\b[^\n]*\b(?:cat|head|tail|less|more|sed|awk|grep|rg|strings|open|read_text|read_bytes|Get-Content)\b)",
+    re.IGNORECASE,
+)
+_MAX_JUDGE_GRADLE_STEPS = 64
+_MAX_JUDGE_GRADLE_SOURCE_EVENTS = 256
+_MAX_JUDGE_GRADLE_SUMMARY_BYTES = 16_384
 _RECOVERABLE_LOGGED_GRADLE_RUN = re.compile(
     r"(?:^|[;\n])\s*python(?:3(?:\.\d+)?)?\s+\S*gradle_run\.py"
     r"(?:\\?['\"])*\s+(?P<arguments>(?:create|run|finish)\b[^\n]*)"
@@ -213,6 +222,60 @@ def _is_simple_local_read(command: str) -> bool:
     )
 
 
+def _is_bare_or_system_executable(token: str, executable: str) -> bool:
+    return token in {
+        executable,
+        f"/bin/{executable}",
+        f"/usr/bin/{executable}",
+    }
+
+
+def _is_target_skill_entrypoint_read(case: EvalCase, command: str) -> bool:
+    """Allow only one standalone read of this case's target skill entrypoint."""
+    if _command_substitutions(command) or _ends_with_background_operator(command):
+        return False
+    segments, separators = _shell_parts(command)
+    if len(segments) != 1 or separators:
+        return False
+    invocation = segments[0]
+    if not invocation:
+        return False
+
+    executable = PurePosixPath(invocation[0])
+    if executable.name in _SHELL_EXECUTABLES:
+        if (
+            len(invocation) != 3
+            or invocation[1] not in {"-c", "-lc"}
+            or not _is_bare_or_system_executable(
+                invocation[0], executable.name
+            )
+        ):
+            return False
+        script = invocation[2]
+        if _command_substitutions(script) or _ends_with_background_operator(script):
+            return False
+        nested_segments, nested_separators = _shell_parts(script)
+        if len(nested_segments) != 1 or nested_separators:
+            return False
+        invocation = nested_segments[0]
+        if not invocation:
+            return False
+        executable = PurePosixPath(invocation[0])
+
+    if len(invocation) > 1 and invocation[1] == "--":
+        invocation = (invocation[0], *invocation[2:])
+    if (
+        executable.name != "cat"
+        or len(invocation) != 2
+        or not _is_bare_or_system_executable(invocation[0], "cat")
+    ):
+        return False
+    return any(
+        invocation[1] == f".agents/skills/{skill}/SKILL.md"
+        for skill in case.target_skills
+    )
+
+
 def _is_shell_wrapped_local_read_sequence(command: str, exit_code: object) -> bool:
     try:
         wrapper = shlex.split(command)
@@ -265,6 +328,9 @@ def _is_shell_wrapped_local_read_sequence(command: str, exit_code: object) -> bo
             return False
         if executable.name == "pwd":
             if len(tokens) != 1:
+                return False
+        elif executable.name == "cat":
+            if len(tokens) < 2 or any(token.startswith("-") for token in tokens[1:]):
                 return False
         elif executable.name == "sed":
             if (
@@ -776,6 +842,136 @@ def _requires_gradle_workflow(patterns: tuple[str, ...]) -> bool:
     )
 
 
+def _option_value(invocation: tuple[str, ...], option: str) -> str | None:
+    for index, token in enumerate(invocation):
+        if token == option and index + 1 < len(invocation):
+            return invocation[index + 1]
+        if token.startswith(option + "="):
+            return token.partition("=")[2]
+    return None
+
+
+def _bounded_json_object(output: object) -> dict[str, object] | None:
+    """Parse only compact JSON outputs; callers forward no raw values."""
+    if not isinstance(output, str):
+        return None
+    try:
+        if len(output.encode("utf-8")) > _MAX_JUDGE_GRADLE_SUMMARY_BYTES:
+            return None
+    except UnicodeEncodeError:
+        return None
+    try:
+        value = json.loads(output)
+    except (json.JSONDecodeError, UnicodeEncodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _valid_workflow_id(value: object) -> bool:
+    return isinstance(value, str) and _WORKFLOW_ID.fullmatch(value) is not None
+
+
+def gradle_execution_evidence(
+    events: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    """Build a bounded, privacy-preserving summary of subject command events.
+
+    Only fixed labels, integers, booleans, and opaque workflow aliases leave this
+    function. Command strings, question text, paths, and captured output are used
+    locally for classification but are never copied into the evidence packet.
+    """
+    source = events[:_MAX_JUDGE_GRADLE_SOURCE_EVENTS]
+    aliases: dict[str, str] = {}
+    steps: list[dict[str, object]] = []
+    command_event_count = 0
+    for index, event in enumerate(source):
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command_event_count += 1
+        command = item.get("command")
+        if isinstance(command, list):
+            command = shlex.join(str(part) for part in command)
+        if not isinstance(command, str):
+            command = ""
+
+        invocation = _standalone_gradle_run_invocation(command)
+        operation = _gradle_run_operation(invocation) if invocation is not None else None
+        exit_code = item.get("exit_code")
+        if len(steps) >= _MAX_JUDGE_GRADLE_STEPS:
+            continue
+        step: dict[str, object] = {
+            "sequence": index + 1,
+            "operation": operation or "other",
+            "exit_code": exit_code if isinstance(exit_code, int) else None,
+        }
+        if operation is not None and invocation is not None:
+            wrapper_output = _bounded_json_object(item.get("aggregated_output"))
+            workflow = _workflow_option(invocation)
+            if operation == "create" and wrapper_output is not None:
+                workflow = wrapper_output.get("workflow")
+            if _valid_workflow_id(workflow):
+                step["workflow"] = aliases.setdefault(
+                    workflow, f"workflow-{len(aliases) + 1}"
+                )
+            else:
+                step["workflow"] = None
+            if operation == "run":
+                scope = _option_value(invocation, "--scope")
+                step["scope"] = scope if scope in {"targeted", "broad"} else None
+                question = _option_value(invocation, "--question")
+                step["question_present"] = bool(question and question.strip())
+                nested_calls = _including_nested_gradle(invocation, successful_only=False)
+                nested = next(
+                    (call for call in nested_calls[1:] if call and _is_gradle_executable(call[0])),
+                    None,
+                )
+                if nested is None:
+                    step["nested_gradle"] = None
+                else:
+                    launcher = PurePosixPath(nested[0]).name
+                    step["nested_gradle"] = {
+                        "launcher": "gradle" if launcher == "gradle" else "gradlew",
+                        "test_task_requested": any(
+                            token == "test" or token.endswith(":test")
+                            for token in nested[1:]
+                        ),
+                        "offline": "--offline" in nested[1:],
+                    }
+                step["bounded_json_summary"] = bool(
+                    wrapper_output is not None
+                    and isinstance(wrapper_output.get("exit_status"), int)
+                    and wrapper_output.get("scope") in {"targeted", "broad"}
+                    and isinstance(wrapper_output.get("excerpt"), list)
+                    and isinstance(wrapper_output.get("failed_tasks"), list)
+                    and isinstance(wrapper_output.get("log"), str)
+                    and isinstance(wrapper_output.get("command"), str)
+                )
+        else:
+            invocations = _command_invocations(command) if command else ()
+            wrapper_present = any(_gradle_run_operation(call) is not None for call in invocations)
+            if wrapper_present:
+                step["operation"] = "unrecognized"
+            step["unwrapped_gradle_command"] = any(
+                _is_gradle_executable(call[0])
+                and PurePosixPath(call[0]).name != "gradle_run.py"
+                for call in invocations
+            ) and not wrapper_present
+            step["possible_log_read"] = bool(_POSSIBLE_LOG_READ.search(command))
+        steps.append(step)
+
+    return {
+        "captured_command_event_count": command_event_count,
+        "truncated": (
+            len(events) > _MAX_JUDGE_GRADLE_SOURCE_EVENTS
+            or command_event_count > _MAX_JUDGE_GRADLE_STEPS
+        ),
+        "steps": steps,
+    }
+
+
 def _standalone_gradle_run_invocation(command: str) -> tuple[str, ...] | None:
     if (
         _command_substitutions(command)
@@ -902,6 +1098,35 @@ def grade_subject(case: EvalCase, result: SubjectResult) -> ObjectiveGrade:
             failures.append(f"validator failed: {' '.join(validator.argv)}{suffix}")
     successful_commands = _event_invocations(result.events, successful_only=True)
     attempted_commands = _event_invocations(result.events)
+    command_execution_events = tuple(
+        event["item"]
+        for event in result.events
+        if isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "command_execution"
+    )
+
+    def is_allowed_skill_read(item: dict[str, object]) -> bool:
+        if result.arm != "forced":
+            return False
+        command = item.get("command")
+        if isinstance(command, list):
+            command = shlex.join(str(part) for part in command)
+        return isinstance(command, str) and _is_target_skill_entrypoint_read(
+            case, command
+        )
+
+    distinct_command_ids = {
+        ("id", item["id"])
+        if isinstance(item.get("id"), str)
+        else ("event", index)
+        for index, item in enumerate(command_execution_events)
+    }
+    disallowed_command_execution = case.forbid_all_commands and (
+        len(distinct_command_ids) > 1
+        or any(not is_allowed_skill_read(item) for item in command_execution_events)
+    )
+    if disallowed_command_execution:
+        failures.append("command execution forbidden for this case")
     for pattern in case.required_command_patterns:
         if not any(
             _command_matches(pattern, command) for command in successful_commands
@@ -916,6 +1141,8 @@ def grade_subject(case: EvalCase, result: SubjectResult) -> ObjectiveGrade:
             failures.append(f"forbidden command evidence found: {pattern}")
 
     violations: list[str] = []
+    if disallowed_command_execution:
+        violations.append("command executed despite analysis-only boundary")
     if case.task_mode == "review" and result.changed_paths:
         violations.append("review case changed workspace")
     for path in result.changed_paths:

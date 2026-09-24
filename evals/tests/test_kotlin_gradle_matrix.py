@@ -1,5 +1,7 @@
 import json
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,9 +9,19 @@ from unittest.mock import patch
 
 from evals.harness.cases import validate_corpus
 from evals.harness.codex import prepare_workspace
-from evals.harness.experiment import filter_cases, preflight
+from evals.harness.experiment import (
+    CODEX_VERSION_TIMEOUT_SECONDS,
+    COMMAND_OUTPUT_TIMEOUT_SECONDS,
+    GRADLE_PREFLIGHT_TIMEOUT_SECONDS,
+    _command_output,
+    filter_cases,
+    preflight,
+    reconcile_automatic_eligibility,
+)
 from evals.harness.grade import grade_subject
+from evals.harness.score import _routing_metrics
 from evals.harness.suites import KOTLIN_GRADLE_SKILLS
+from evals.validators.text_case import _mask_kotlin_comments
 from evals.tests.test_grade import make_result
 
 
@@ -92,6 +104,153 @@ class KotlinGradleMatrixTest(unittest.TestCase):
             "Edit only `src/main/kotlin/example/Subject.kt`", case.prompt
         )
 
+    def test_kotlin_api_ownership_expectations_accept_multiline_domain_owners(self):
+        expectation_path = (
+            REPO_ROOT
+            / "evals/cases/kotlin-api-ownership-direct/expectations.json"
+        )
+        expectation = json.loads(expectation_path.read_text(encoding="utf-8"))
+        patterns = expectation["must_match"]
+        sources = (
+            """interface ProfileStore {
+    fun loadProfile(rawUserId: String): User
+}
+
+@Deprecated(
+    message = "Use ProfileStore.loadProfile"
+)
+fun String.loadProfile(
+    store: ProfileStore
+): User {
+    return store.loadProfile(this)
+}
+
+fun profileFor(
+    rawUserId: String,
+    store: ProfileStore,
+): User {
+    return store.loadProfile(rawUserId)
+}
+""",
+            """package com.example
+
+interface ProfileStore {
+    fun load(rawUserId: String): User
+}
+
+data class ProfileRepository(private val store: ProfileStore) {
+    fun loadProfile(userId: String): User = store.load(userId)
+}
+
+@Deprecated("Use ProfileRepository")
+fun String.loadProfile(
+    repository: com.example.ProfileRepository,
+): User = repository.loadProfile(this)
+
+fun profileFor(userId: String, repository: com.example.ProfileRepository): User =
+    repository.loadProfile(userId)
+""",
+            """interface ProfileStore {
+    fun loadProfile(rawUserId: String): User
+}
+
+@Deprecated("Use ProfileStore.loadProfile")
+fun String.loadProfile(store: ProfileStore): User {
+    // Preserve the source-compatible entry point.
+    val originalId = this
+    return store.loadProfile(this)
+}
+
+fun profileFor(userId: String, store: ProfileStore): User =
+    store.loadProfile(userId)
+""",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                for pattern in patterns:
+                    self.assertIsNotNone(
+                        re.search(
+                            pattern,
+                            _mask_kotlin_comments(source),
+                            re.MULTILINE | re.DOTALL,
+                        )
+                    )
+
+        direct_repository_access = """interface ProfileStore {
+    fun loadProfile(rawUserId: String): User
+}
+
+object ProfileDatabase {
+    fun loadProfile(rawUserId: String): User = TODO()
+}
+
+@Deprecated("Use ProfileStore")
+fun String.loadProfile(store: ProfileStore): User =
+    ProfileDatabase.loadProfile(this)
+
+fun profileFor(rawUserId: String, store: ProfileStore): User =
+    store.loadProfile(rawUserId)
+"""
+        shim_delegation = patterns[1]
+        self.assertIsNone(
+            re.search(shim_delegation, direct_repository_access, re.MULTILINE | re.DOTALL)
+        )
+        commented_delegation = """@Deprecated("Use ProfileStore")
+fun String.loadProfile(store: ProfileStore): User {
+    // return store.loadProfile(this)
+    return ProfileDatabase.loadProfile(this)
+}
+"""
+        block_commented_delegation = """@Deprecated("Use ProfileStore")
+fun String.loadProfile(store: ProfileStore): User {
+    /* A nested comment /* still a comment */
+    return store.loadProfile(this)
+    */
+    return ProfileDatabase.loadProfile(this)
+}
+"""
+        for source in (commented_delegation, block_commented_delegation):
+            with self.subTest(source=source):
+                self.assertIsNone(
+                    re.search(
+                        shim_delegation,
+                        _mask_kotlin_comments(source),
+                        re.MULTILINE | re.DOTALL,
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "src/main/kotlin/example/Subject.kt"
+            source_path.parent.mkdir(parents=True)
+            invalid_source = (
+                """interface ProfileStore {
+    fun loadProfile(rawUserId: String): User
+}
+"""
+                + block_commented_delegation
+                + """
+fun profileFor(userId: String, store: ProfileStore): User =
+    store.loadProfile(userId)
+"""
+            )
+            for source, expected_code in ((sources[2], 0), (invalid_source, 1)):
+                with self.subTest(validator_exit=expected_code):
+                    source_path.write_text(source, encoding="utf-8")
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(REPO_ROOT / "evals/validators/text_case.py"),
+                            "kotlin-api-ownership-direct",
+                        ],
+                        cwd=temp_dir,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(expected_code, result.returncode, result.stderr)
+
     def test_event_channel_expectation_accepts_equivalent_bounded_capacities(self):
         expectation_path = (
             REPO_ROOT
@@ -151,6 +310,69 @@ class KotlinGradleMatrixTest(unittest.TestCase):
                 with self.subTest(case=case_id, command=command):
                     self.assertIsNone(re.search(run_pattern, command, re.DOTALL))
 
+    def test_gradle_routing_is_expected_only_after_an_invocation(self):
+        report = validate_corpus(REPO_ROOT, suite="kotlin-gradle")
+        case_ids = (
+            "kotlin-api-ownership-direct",
+            "kotlin-api-value-class-direct",
+            "kotlin-control-exhaustiveness-direct",
+            "kotlin-control-guards-direct",
+            "kotlin-coroutine-ownership-direct",
+            "kotlin-detached-thread-ownership-direct",
+            "kotlin-flow-event-delivery-direct",
+        )
+        cases = [
+            next(case for case in report.cases if case.id == case_id)
+            for case_id in case_ids
+        ]
+        records = [
+            {
+                "case_id": case.id,
+                "arm": "automatic",
+                "subject": {
+                    "events": [
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "command_execution",
+                                "command": "rg --files -g 'gradlew'",
+                            },
+                        }
+                    ]
+                },
+            }
+            for case in cases
+        ]
+
+        for case in cases:
+            self.assertEqual(case.target_skills, case.expected_skills)
+            self.assertIn("gradle-run", case.allowed_skills)
+        reconcile_automatic_eligibility(REPO_ROOT, cases, records)
+        self.assertTrue(
+            all("gradle-run" not in record["expected_skills"] for record in records)
+        )
+        self.assertTrue(
+            all("gradle-run" not in record["allowed_skills"] for record in records)
+        )
+        records[0]["reported_skills"] = [*records[0]["expected_skills"], "gradle-run"]
+        self.assertLess(_routing_metrics([records[0]])[0], 1.0)
+
+        records[0]["subject"]["events"] = [
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        "python3 .agents/skills/gradle-run/scripts/gradle_run.py run "
+                        "--scope targeted --question test -- ./gradlew --offline test"
+                    ),
+                },
+            }
+        ]
+        reconcile_automatic_eligibility(REPO_ROOT, cases, records)
+        self.assertIn("gradle-run", records[0]["expected_skills"])
+        self.assertIn("gradle-run", records[0]["allowed_skills"])
+
     def test_kotlin_fixture_is_pinned_and_offline_ready(self):
         fixture = REPO_ROOT / "evals" / "fixtures" / "kotlin-jvm"
         build = (fixture / "build.gradle.kts").read_text(encoding="utf-8")
@@ -196,6 +418,90 @@ class KotlinGradleMatrixTest(unittest.TestCase):
             [str(fixture / "subject-gradlew"), "--offline", "--no-scan", "test"],
             commands,
         )
+        timeout_by_command = {
+            tuple(call.args[0]): call.kwargs.get(
+                "timeout_seconds", COMMAND_OUTPUT_TIMEOUT_SECONDS
+            )
+            for call in command_output.call_args_list
+        }
+        self.assertEqual(
+            CODEX_VERSION_TIMEOUT_SECONDS,
+            timeout_by_command[("codex", "--version")],
+        )
+        self.assertEqual(
+            COMMAND_OUTPUT_TIMEOUT_SECONDS,
+            timeout_by_command[("git", "rev-parse", "HEAD")],
+        )
+        self.assertEqual(
+            GRADLE_PREFLIGHT_TIMEOUT_SECONDS,
+            timeout_by_command[
+                (str(fixture / "gradlew"), "--offline", "--no-scan", "test")
+            ],
+        )
+
+    def test_command_output_passes_a_bounded_default_timeout(self):
+        completed = subprocess.CompletedProcess(
+            args=["git", "rev-parse", "HEAD"], returncode=0, stdout="abc\n", stderr=""
+        )
+        with patch(
+            "evals.harness.experiment.subprocess.run", return_value=completed
+        ) as run:
+            output = _command_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT)
+
+        self.assertEqual("abc", output)
+        self.assertEqual(COMMAND_OUTPUT_TIMEOUT_SECONDS, run.call_args.kwargs["timeout"])
+
+    def test_cli_version_timeout_fails_with_installation_guidance(self):
+        timeout = subprocess.TimeoutExpired(
+            cmd=["codex", "--version"], timeout=CODEX_VERSION_TIMEOUT_SECONDS
+        )
+        with patch(
+            "evals.harness.experiment.subprocess.run", side_effect=timeout
+        ) as run:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"codex --version timed out after 10s.*installation.*signature",
+            ):
+                preflight(REPO_ROOT, "codex", ())
+
+        self.assertEqual(CODEX_VERSION_TIMEOUT_SECONDS, run.call_args.kwargs["timeout"])
+
+    def test_gradle_fixture_timeout_reports_fixture_and_offline_guidance(self):
+        report = validate_corpus(REPO_ROOT, suite="kotlin-gradle")
+        case = next(
+            case
+            for case in report.cases
+            if (REPO_ROOT / "evals" / "fixtures" / case.fixture / "gradlew").is_file()
+        )
+        fixture = REPO_ROOT / "evals" / "fixtures" / case.fixture
+        timeout = subprocess.TimeoutExpired(
+            cmd=[str(fixture / "gradlew"), "--offline", "--no-scan", "test"],
+            timeout=GRADLE_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+        codex_completed = subprocess.CompletedProcess(
+            args=["codex", "--version"], returncode=0, stdout="ok\n", stderr=""
+        )
+        git_completed = subprocess.CompletedProcess(
+            args=["git", "rev-parse", "HEAD"],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with patch(
+            "evals.harness.experiment.subprocess.run",
+            side_effect=[
+                codex_completed,
+                git_completed,
+                timeout,
+            ],
+        ) as run:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"gradlew --offline --no-scan test timed out after 180s.*offline Gradle dependencies",
+            ):
+                preflight(REPO_ROOT, "codex", (case,))
+
+        self.assertEqual(GRADLE_PREFLIGHT_TIMEOUT_SECONDS, run.call_args.kwargs["timeout"])
 
 
 if __name__ == "__main__":
