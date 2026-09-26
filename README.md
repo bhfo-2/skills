@@ -179,6 +179,38 @@ For a taxonomy change, also run the durable
 required references, safeguards, exceptions, and finish gates at the public
 agent-facing seam.
 
+Before publishing a release, manually run the advisory evaluations for the
+changed skills. Select each affected suite; when shared evaluation machinery
+changes, include every suite affected by that change. Preview each suite with
+the intended filters and current subject and judge cost assumptions:
+
+```sh
+python3 evals/run.py plan \
+  --suite <suite> \
+  --skill <changed-skill> \
+  --model <model> \
+  --reasoning <effort> \
+  --judge-model <judge-model> \
+  --judge-reasoning <effort> \
+  --subject-cost-per-call-usd <amount> \
+  --judge-cost-per-call-usd <amount> \
+  --json
+```
+
+Repeat `--skill` for each changed skill. Without a `--case` filter, omitting
+`--skill` selects all non-calibration cases in the suite. Calibration cases are
+excluded unless you pass their explicit IDs with `--case`. Inspect `case_ids` in
+the JSON output and confirm the selected cases match the intended scope before
+reviewing call counts and estimated cost. The `plan` preview includes only the
+counts and cost for first attempts. Execution may automatically retry each
+subject and judge call once. Before `--execute`, get explicit cost approval for
+up to twice the previewed subject calls, judge calls, and estimated cost, to
+cover one retry per call. Execute the matching `run` command manually. Report
+invalid or inconclusive results. Before any rerun, preview again, inspect its
+`case_ids`, review the calls and cost, and get new approval for the same retry
+headroom. Results remain advisory, not release gates. See
+[`evals/README.md`](evals/README.md) for suite selection and command options.
+
 ## Evaluating skills
 
 The advisory evaluator tests concrete scenarios modelled on real-world coding
