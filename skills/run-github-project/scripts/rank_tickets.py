@@ -344,6 +344,63 @@ def has_current_user_assignment(ticket: Any, current_user: str) -> bool:
     )
 
 
+def is_backlog_cleanup_candidate(
+    ticket: Any,
+    *,
+    current_user: str,
+    backlog_status: str,
+) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+    backlog_transition = ticket.get("backlogTransition")
+    replan_request = ticket.get("replanRequest")
+    pull_requests = ticket.get("openPullRequests")
+    transition_actor = (
+        backlog_transition.get("actor")
+        if isinstance(backlog_transition, dict)
+        else None
+    )
+    has_cleanup_transition = (
+        backlog_transition is not None
+        and (
+            not isinstance(backlog_transition, dict)
+            or (
+                not (
+                    isinstance(transition_actor, str)
+                    and transition_actor
+                    and transition_actor != current_user
+                )
+                and backlog_transition.get("wasAutomated") is not True
+            )
+        )
+    )
+    has_cleanup_report = replan_request is not None
+    if isinstance(replan_request, dict):
+        report_author = replan_request.get("author")
+        report_disposition = replan_request.get("disposition")
+        if (
+            isinstance(report_author, str)
+            and report_author
+            and report_author != current_user
+        ) or report_disposition == "autonomous-replan":
+            has_cleanup_report = False
+    has_runner_owned_pull_request = (
+        isinstance(pull_requests, list)
+        and any(
+            isinstance(pull_request, dict)
+            and pull_request.get("author") == current_user
+            and pull_request.get("closesIssue") is not False
+            for pull_request in pull_requests
+        )
+    )
+    return (
+        ticket.get("projectStatus") == backlog_status
+        and has_current_user_assignment(ticket, current_user)
+        and has_cleanup_transition
+        and (has_cleanup_report or has_runner_owned_pull_request)
+    )
+
+
 def parse_transition(value: Any, field: str, number: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InputError(f"ticket {number}: {field} must be an object")
@@ -587,6 +644,8 @@ def analyze_ticket(
     planning_status: str,
     ready_status: str,
     in_progress_status: str,
+    needs_triage_label: str,
+    human_work_label: str,
     priorities: tuple[str, ...],
     repository: str,
     base_branch: str,
@@ -612,6 +671,15 @@ def analyze_ticket(
 
     errors = common["errors"]
     exclusions = common["exclusions"]
+    if (
+        recovering_backlog_cleanup
+        and human_work_label in labels
+        and (
+            AGENT_WORK_LABEL in labels
+            or needs_triage_label in labels
+        )
+    ):
+        exclusions.append("conflicting Backlog action labels")
     if AGENT_WORK_LABEL not in labels and not recovering_backlog_cleanup:
         exclusions.append(f"missing {AGENT_WORK_LABEL} label")
 
@@ -925,6 +993,23 @@ def analyze_ticket(
             ):
                 exclusions.append(
                     "human-work report does not identify the current plan",
+                )
+            if (
+                ready_transition is not None
+                and replan_request["createdAt"] < ready_transition["createdAt"]
+            ):
+                exclusions.append(
+                    "human-work report predates the latest Ready handoff",
+                )
+            if own_closing_pull_requests and not (
+                len(own_closing_pull_requests) == 1
+                and replan_request["pullRequestUrl"]
+                == own_closing_pull_requests[0]["url"]
+                and replan_request["implementationHeadSha"]
+                == own_closing_pull_requests[0]["headSha"]
+            ):
+                exclusions.append(
+                    "human-work report does not match the retained PR",
                 )
             if (
                 backlog_transition is not None
@@ -1427,6 +1512,11 @@ def main() -> int:
                         if isinstance(label, str)
                     )
                 )
+                is_backlog_cleanup = is_backlog_cleanup_candidate(
+                    ticket,
+                    current_user=args.current_user,
+                    backlog_status=args.backlog_status,
+                )
                 if has_wayfinder_map_label:
                     invalid = {
                         "number": ticket["number"],
@@ -1467,6 +1557,7 @@ def main() -> int:
                         or (
                             isinstance(ticket["labels"], list)
                             and args.human_work_label in ticket["labels"]
+                            and not is_backlog_cleanup
                         )
                     )
                 ):
@@ -1488,6 +1579,8 @@ def main() -> int:
                             planning_status=args.planning_status,
                             ready_status=args.ready_status,
                             in_progress_status=args.in_progress_status,
+                            needs_triage_label=args.needs_triage_label,
+                            human_work_label=args.human_work_label,
                             priorities=priorities,
                             repository=args.repository,
                             base_branch=args.base_branch,
@@ -1505,6 +1598,11 @@ def main() -> int:
                     and isinstance(raw_ticket.get("labels"), list)
                     and args.human_work_label in raw_ticket["labels"]
                 )
+                is_backlog_cleanup = is_backlog_cleanup_candidate(
+                    raw_ticket,
+                    current_user=args.current_user,
+                    backlog_status=args.backlog_status,
+                )
                 is_wayfinder_claim = (
                     isinstance(raw_ticket, dict)
                     and isinstance(raw_ticket.get("labels"), list)
@@ -1515,7 +1613,9 @@ def main() -> int:
                     )
                     and has_current_user_assignment(raw_ticket, args.current_user)
                 )
-                if is_human_frontier_item:
+                if is_backlog_cleanup:
+                    invalid_planning_claimed.append(invalid)
+                elif is_human_frontier_item:
                     invalid_unclaimed.append(invalid)
                 elif is_wayfinder_claim:
                     invalid_planning_claimed.append(invalid)
