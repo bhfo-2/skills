@@ -3,6 +3,9 @@
 Copy this structure to `docs/agents/run-github-project.md` in the repository
 that owns the queue. Replace every placeholder with live verified data. The
 closest trusted `AGENTS.md` or `CLAUDE.md` must reference that exact file.
+For an existing binding, run `setup` from its current values instead of copying
+this template over it. Follow the
+[additive setup procedure](review-and-setup.md#additive-setup-for-an-existing-repository).
 
 ```markdown
 # Run GitHub Project
@@ -48,6 +51,18 @@ closest trusted `AGENTS.md` or `CLAUDE.md` must reference that exact file.
 - Epic label ID: `<LA_...>`
 - Human-work label: `<repository label mapped to ready-for-human>`
 - Human-work label ID: `<LA_...>`
+
+## Agent Setup (optional)
+
+- Routing: `<configured or typesafe>`
+- Default planner profile: `<profile name>`
+- Default ticket profile: `<profile name>`
+- TypeSafe judgment model: `<versioned model ID, only for typesafe routing>`
+
+| Profile | Capability | Best suited to | Runtime role | Execution model | Reasoning |
+| --- | --- | --- | --- | --- | --- |
+| `<name>` | `default-owner` | `<bounded task description>` | `<role>` | `<model or runtime-default>` | `<level or runtime-default>` |
+| `<evidence-name>` | `read-only-evidence` | `Repeated non-CI failure investigation` | `<read-only role, if available>` | `<model or runtime-default>` | `<level or runtime-default>` |
 
 ## Wayfinder (optional)
 
@@ -104,6 +119,25 @@ runner. Before migrating an existing queue, require zero `In progress` items
 and have an execution approver move every legacy Ready item to `Planning`.
 Revalidate even an existing marker plan through the planning lane before its
 runner-authored Ready handoff.
+
+Omit Agent Setup to use runtime-default agents under the existing capability
+rules. When present, require unique profile names, a default-owner profile for
+both planner and ticket defaults, and a runtime role with the required access
+for every profile. Include a `read-only-evidence` row when the runtime supports
+it because the repair progress gate needs that helper. Add
+`read-only-discovery` or `exceptional-investigator` rows only when wanted. When
+no read-only evidence role is available, disclose that repeated non-CI stalls
+remain ticket-local blockers. The named defaults are preferences; table order
+is the deterministic fallback order for other eligible profiles. Give each
+profile a short, distinct task fit when multiple profiles share a capability under
+`typesafe` routing. Explicit execution models and reasoning levels must be
+supported by that runtime; `runtime-default` defers the choice to it. Profiles
+describe allowed agents, not new authority. Keep the user-selected lead model
+and any explicit agent-model pin unchanged. Do not put API keys in this file.
+`typesafe` routing is optional and sends a sanitized ticket brief to TypeSafe;
+read [agent routing](agent-routing.md) before enabling it. TypeSafe may select
+only an eligible configured profile, never a new model or the lead model. Log
+confidence when exposed; do not configure an uncalibrated numeric cutoff.
 
 ## Live Merge-Policy Fingerprint
 
